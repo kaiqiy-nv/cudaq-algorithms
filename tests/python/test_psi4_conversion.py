@@ -101,3 +101,68 @@ def test_pyscf_and_psi4_qubit_hamiltonians_match(label, basis, geometry):
     assert np.allclose(pyscf_spectrum, psi4_spectrum, atol=1e-6), (
         f"{label}: PySCF and Psi4 qubit-Hamiltonian spectra differ by "
         f"{np.max(np.abs(pyscf_spectrum - psi4_spectrum)):.2e}")
+
+
+def test_from_psi4_validation_and_integral_extraction(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    psi4_module = ModuleType("psi4")
+    monkeypatch.setitem(sys.modules, "psi4", psi4_module)
+
+    with pytest.raises(ValueError, match="C1"):
+        algorithms.chemistry.from_psi4(SimpleNamespace(nirrep=lambda: 2))
+
+    unrestricted = SimpleNamespace(nirrep=lambda: 1,
+                                   same_a_b_orbs=lambda: False)
+    with pytest.raises(ValueError, match="restricted"):
+        algorithms.chemistry.from_psi4(unrestricted)
+
+    coefficients_matrix = np.array([[1.0, 0.5], [0.0, 1.0]])
+    core_ao = np.array([[2.0, -1.0], [-1.0, 3.0]])
+    eri = np.arange(16.0).reshape((2, 2, 2, 2))
+    basis = object()
+
+    class MintsHelper:
+
+        def __init__(self, requested_basis):
+            assert requested_basis is basis
+
+        def mo_eri(self, *coefficients):
+            assert len(coefficients) == 4
+            assert all(coefficient is coefficients_matrix
+                       for coefficient in coefficients)
+            return eri
+
+    psi4_module.core = SimpleNamespace(MintsHelper=MintsHelper)
+    wavefunction = SimpleNamespace(
+        nirrep=lambda: 1,
+        same_a_b_orbs=lambda: True,
+        Ca=lambda: coefficients_matrix,
+        H=lambda: core_ao,
+        basisset=lambda: basis,
+        molecule=lambda: SimpleNamespace(nuclear_repulsion_energy=lambda: 0.7))
+
+    one_body, extracted_eri, core_energy = algorithms.chemistry.from_psi4(
+        wavefunction)
+
+    np.testing.assert_allclose(
+        one_body, coefficients_matrix.T @ core_ao @ coefficients_matrix)
+    np.testing.assert_array_equal(extracted_eri, eri)
+    assert core_energy == pytest.approx(0.7)
+    assert isinstance(core_energy, float)
+    assert one_body.flags.c_contiguous
+    assert extracted_eri.flags.c_contiguous
+
+
+def test_from_pyscf_rejects_unrestricted_coefficients(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    pyscf_module = ModuleType("pyscf")
+    pyscf_module.ao2mo = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "pyscf", pyscf_module)
+
+    mean_field = SimpleNamespace(mol=object(), mo_coeff=np.zeros((2, 2, 2)))
+    with pytest.raises(ValueError, match=r"restricted.*ndim 3"):
+        algorithms.chemistry.from_pyscf(mean_field)

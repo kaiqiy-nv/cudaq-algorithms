@@ -230,6 +230,8 @@ def test_trotter_orders_terms_and_estimates_resources():
         hamiltonian,
         ordering=trotter.TrotterOrdering.COEFFICIENT_MAGNITUDE_DESCENDING)
 
+    assert (evolution.ordering
+            is trotter.TrotterOrdering.COEFFICIENT_MAGNITUDE_DESCENDING)
     assert evolution.identity_coefficient == pytest.approx(-0.2)
     assert evolution.coefficients == pytest.approx([0.7, 0.4, 0.1])
     assert [str(word) for word in evolution.words] == ["IZ", "XZ", "XI"]
@@ -240,6 +242,29 @@ def test_trotter_orders_terms_and_estimates_resources():
     assert resources.order == 4
     assert resources.pauli_rotations == 3 * 3 * 6
     assert resources.estimated_cx_count == 2 * 3 * 6
+
+
+def test_trotter_magnitude_ordering_handles_identity_only_hamiltonian():
+    evolution = trotter.Trotter(
+        {"II": -0.2},
+        ordering=trotter.TrotterOrdering.COEFFICIENT_MAGNITUDE_DESCENDING)
+
+    assert evolution.coefficients == []
+    assert evolution.words == []
+    assert evolution.identity_coefficient == pytest.approx(-0.2)
+    assert evolution.num_qubits == 2
+    assert (evolution.ordering
+            is trotter.TrotterOrdering.COEFFICIENT_MAGNITUDE_DESCENDING)
+
+
+def test_trotter_repr_reports_term_count_width_and_identity_coefficient():
+    evolution = trotter.Trotter({
+        "XI": 0.7,
+        "IZ": -0.4,
+        "II": -0.123456789,
+    })
+    assert repr(evolution) == (
+        "Trotter(terms=2, qubits=2, identity_coefficient=-0.123457)")
 
 
 def test_trotter_rejects_invalid_options():
@@ -262,6 +287,11 @@ def test_estimate_trotter_resources_accepts_flattened_terms():
     assert resources.num_terms == 2
     assert resources.pauli_rotations == 8
     assert resources.estimated_cx_count == 8
+
+
+def test_estimate_trotter_resources_rejects_mismatched_terms():
+    with pytest.raises(ValueError, match="equal length"):
+        trotter.estimate_trotter_resources([0.5], [], steps=1, order=1)
 
 
 # ----------------------------------------------------------------------------
@@ -459,6 +489,38 @@ def test_kernel_factory_accepts_state_prep_injection():
     assert sum(counts.values()) == 100
 
 
+def test_order_four_kernel_factories_match_reference():
+    evolution = trotter.Trotter({"XI": 0.7, "IZ": 0.4, "XZ": 0.31, "YY": 0.23})
+    time, steps, order = 0.8, 2, 4
+    prepared_ket = _two_qubit_product_state(0.37, -0.52)
+    zero_ket = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
+
+    via_prep = np.asarray(cudaq.get_state(
+        evolution.kernel(time=time,
+                         steps=steps,
+                         order=order,
+                         state_prep=_product_prep)),
+                          dtype=np.complex128)
+    via_state = np.asarray(cudaq.get_state(
+        evolution.state_kernel(time=time, steps=steps, order=order),
+        sim_utils.state_from(prepared_ket)),
+                           dtype=np.complex128)
+    via_zero = np.asarray(cudaq.get_state(
+        evolution.kernel(time=time, steps=steps, order=order)),
+                          dtype=np.complex128)
+
+    expected_prepared = _simulate_trotter(evolution.coefficients,
+                                          evolution.words, 0.0,
+                                          evolution.num_qubits, time, steps,
+                                          order, prepared_ket)
+    expected_zero = _simulate_trotter(evolution.coefficients, evolution.words,
+                                      0.0, evolution.num_qubits, time, steps,
+                                      order, zero_ket)
+    np.testing.assert_allclose(via_prep, via_state, atol=1e-12)
+    np.testing.assert_allclose(via_prep, expected_prepared, atol=1e-6)
+    np.testing.assert_allclose(via_zero, expected_zero, atol=1e-6)
+
+
 def test_kernel_factory_evolves_the_zero_state():
     hamiltonian = {"XI": 0.7, "IZ": 0.4, "XZ": 0.31, "YY": 0.23}
     evolution = trotter.Trotter(hamiltonian)
@@ -471,6 +533,20 @@ def test_kernel_factory_evolves_the_zero_state():
     expected = _simulate_trotter(evolution.coefficients, evolution.words, 0.0,
                                  evolution.num_qubits, 0.8, 3, 2, ket0)
     np.testing.assert_allclose(factory_state, expected, atol=1e-6)
+
+
+def test_kernel_factory_two_term_one_qubit_evolves_zero_state():
+    evolution = trotter.Trotter({"X": 0.6, "Z": -0.25})
+    assert evolution.num_qubits == 1
+    assert evolution.num_terms == 2
+
+    zero_ket = np.array([1.0, 0.0], dtype=np.complex128)
+    actual = np.asarray(cudaq.get_state(
+        evolution.kernel(time=0.7, steps=3, order=2)),
+                        dtype=np.complex128)
+    expected = _simulate_trotter(evolution.coefficients, evolution.words, 0.0,
+                                 evolution.num_qubits, 0.7, 3, 2, zero_ket)
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
 
 
 def test_sim_utils_evolve_includes_identity_phase():
@@ -536,6 +612,50 @@ def test_identity_only_hamiltonian_kernel_factory_branches():
                                atol=1e-12)
     counts = cudaq.sample(prep_kernel, shots_count=50)
     assert sum(counts.values()) == 50
+
+
+def test_identity_only_state_kernel_preserves_arbitrary_state():
+    evolution = trotter.Trotter({"II": -0.2})
+    assert evolution.words == []
+
+    ket = random_ket(evolution.num_qubits, seed=912)
+    state = np.asarray(cudaq.get_state(
+        evolution.state_kernel(time=0.5, steps=2), sim_utils.state_from(ket)),
+                       dtype=np.complex128)
+    np.testing.assert_allclose(state, ket, atol=1e-12)
+
+
+def test_subthreshold_terms_use_prepared_identity_kernel():
+    evolution = trotter.Trotter({
+        "XI": 1e-14,
+        "II": -0.2
+    },
+                                coefficient_tolerance=1e-12)
+    assert evolution.words == []
+    assert evolution.coefficients == []
+    assert evolution.identity_coefficient == pytest.approx(-0.2)
+    assert evolution.num_qubits == 2
+
+    prepared = np.asarray(cudaq.get_state(
+        evolution.kernel(time=0.5, steps=2, state_prep=_product_prep)),
+                          dtype=np.complex128)
+    np.testing.assert_allclose(prepared,
+                               _two_qubit_product_state(0.37, -0.52),
+                               atol=1e-12)
+
+
+def test_subthreshold_terms_without_prep_use_identity_kernel():
+    evolution = trotter.Trotter({"XII": 1e-14}, coefficient_tolerance=1e-12)
+    assert evolution.words == []
+    assert evolution.coefficients == []
+    assert evolution.identity_coefficient == 0.0
+    assert evolution.num_qubits == 3
+
+    actual = np.asarray(cudaq.get_state(evolution.kernel(time=0.5, steps=2)),
+                        dtype=np.complex128)
+    expected = np.zeros(1 << evolution.num_qubits, dtype=np.complex128)
+    expected[0] = 1.0
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
 
 
 # ----------------------------------------------------------------------------

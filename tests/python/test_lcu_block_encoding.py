@@ -192,6 +192,22 @@ def test_block_dense_action_on_random_ket():
                                atol=1e-10)
 
 
+def test_one_qubit_state_taking_encode_kernel_matches_dense_reference():
+    terms = [(0.6, {0: "z"}), (-0.4, {0: "x"})]
+    encoding = build_encoding(terms=terms, n=1, mu=2)
+    ket = random_ket(2, seed=19)
+    out = np.asarray(cudaq.get_state(
+        encoding.encode_kernel(),
+        state_from(ket, num_qubits=encoding.num_system)),
+                     dtype=np.complex128)
+
+    assert out.size == 1 << (encoding.num_system + encoding.num_ancilla)
+    expected = discretized_dense(encoding, terms, n=encoding.num_system) @ ket
+    np.testing.assert_allclose(out[:1 << encoding.num_system] * encoding.alpha,
+                               expected,
+                               atol=1e-10)
+
+
 # ----------------------------------------------------------------------
 # 3. Self-adjoint involution, walk Chebyshev, controlled conventions
 # ----------------------------------------------------------------------
@@ -400,6 +416,65 @@ def test_state_prep_injection_matches_explicit_state():
     np.testing.assert_allclose(block, quantized @ ket, atol=1e-10)
 
 
+def test_state_prep_encoded_entangled_input_matches_state_kernel():
+    encoding = build_encoding()
+
+    @cudaq.kernel
+    def prep(qubits: cudaq.qview):
+        h(qubits[0])
+        ry(0.37, qubits[1])
+        cx(qubits[0], qubits[1])
+
+    ket = np.array([
+        np.cos(0.37 / 2),
+        np.sin(0.37 / 2),
+        np.sin(0.37 / 2),
+        np.cos(0.37 / 2),
+    ],
+                   dtype=np.complex128) / np.sqrt(2)
+    injected = np.asarray(cudaq.get_state(
+        encoding.encode_kernel(state_prep=prep)),
+                          dtype=np.complex128)
+    explicit = np.asarray(cudaq.get_state(encoding.encode_kernel(),
+                                          state_from(ket)),
+                          dtype=np.complex128)
+
+    np.testing.assert_allclose(injected, explicit, atol=1e-10)
+    np.testing.assert_allclose(injected[:1 << NUM_SYSTEM] * encoding.alpha,
+                               discretized_dense(encoding) @ ket,
+                               atol=1e-10)
+
+
+def test_prepare_kernel_matches_alias_table_marginal():
+    terms = [(1.0, {0: "x"}), (3.0, {0: "z"}), (4.0, {})]
+    encoding = build_encoding(terms=terms, n=1, mu=1)
+    assert encoding.num_index == 2
+    assert encoding.num_garbage > 0
+
+    prepare = encoding.prepare_kernel()
+    num_ancilla = encoding.num_ancilla
+
+    @cudaq.kernel
+    def prepared():
+        ancilla = cudaq.qvector(num_ancilla)
+        prepare(ancilla)
+
+    state = np.asarray(cudaq.get_state(prepared), dtype=np.complex128)
+    index_mask = (1 << encoding.num_index) - 1
+    marginal = np.zeros(encoding.preparation.num_bins)
+    for basis_index, amplitude in enumerate(state):
+        marginal[basis_index & index_mask] += abs(amplitude)**2
+    np.testing.assert_allclose(marginal,
+                               encoding.preparation.table_probabilities,
+                               atol=1e-10)
+
+    if encoding.num_select_work:
+        work_start = encoding.num_index + encoding.num_garbage
+        work_mask = ((1 << encoding.num_select_work) - 1) << work_start
+        work_excited = (np.arange(state.size) & work_mask) != 0
+        assert np.linalg.norm(state[work_excited]) <= 1e-10
+
+
 def test_inspection_and_repr():
     encoding = build_encoding()
     assert encoding.num_system == NUM_SYSTEM
@@ -426,6 +501,66 @@ def test_satisfies_block_encoding_protocol():
 # ----------------------------------------------------------------------
 
 SMALL_TERMS = [(0.6, {0: "z"}), (-0.4, {0: "x"})]  # non-commuting, 1 qubit
+
+
+def test_state_prep_walk_kernel_matches_explicit_state():
+    encoding = build_encoding(terms=SMALL_TERMS, n=1, mu=2)
+    scaled = discretized_dense(encoding, SMALL_TERMS, 1) / encoding.alpha
+
+    @cudaq.kernel
+    def prep(system: cudaq.qview):
+        h(system[0])
+
+    ket = np.array([1.0, 1.0], dtype=np.complex128) / np.sqrt(2.0)
+    prepared_result = np.array(
+        cudaq.get_state(encoding.walk_kernel(power=2, state_prep=prep)))
+    explicit_result = np.array(
+        cudaq.get_state(encoding.walk_kernel(power=2), state_from(ket)))
+
+    np.testing.assert_allclose(prepared_result, explicit_result, atol=1e-10)
+    t2 = 2.0 * scaled @ scaled - np.eye(2)
+    np.testing.assert_allclose(prepared_result[:2], t2 @ ket, atol=1e-10)
+
+    walk = Walk(encoding)
+    walk_prepared = np.array(
+        cudaq.get_state(walk.kernel(power=2, state_prep=prep)))
+    walk_explicit = np.array(
+        cudaq.get_state(walk.kernel(power=2), state_from(ket)))
+
+    np.testing.assert_allclose(walk_prepared, walk_explicit, atol=1e-10)
+    np.testing.assert_allclose(walk_prepared[:2], t2 @ ket, atol=1e-10)
+
+
+def test_state_prep_walk_kernel_zero_power_preserves_prepared_state():
+    encoding = build_encoding(terms=SMALL_TERMS, n=1, mu=2)
+
+    @cudaq.kernel
+    def prep(system: cudaq.qview):
+        h(system[0])
+
+    actual = np.asarray(cudaq.get_state(
+        encoding.walk_kernel(power=0, state_prep=prep)),
+                        dtype=np.complex128)
+    expected = np.zeros_like(actual)
+    expected[:2] = np.ones(2, dtype=np.complex128) / np.sqrt(2.0)
+
+    np.testing.assert_allclose(actual, expected, atol=1e-10)
+
+
+@pytest.mark.parametrize("power", [0, 1])
+def test_state_taking_walk_zero_and_positive_powers(power):
+    encoding = build_encoding(terms=SMALL_TERMS, n=1, mu=2)
+    scaled = discretized_dense(encoding, SMALL_TERMS, 1) / encoding.alpha
+    ket = random_ket(2, seed=23)
+    out = np.array(
+        cudaq.get_state(encoding.walk_kernel(power=power), state_from(ket)))
+
+    if power == 0:
+        expected = np.zeros_like(out)
+        expected[:2] = ket
+        np.testing.assert_allclose(out, expected, atol=1e-10)
+    else:
+        np.testing.assert_allclose(out[:2], -scaled @ ket, atol=1e-10)
 
 
 def chebyshev_moment(scaled: np.ndarray, ket: np.ndarray, order: int) -> float:
@@ -515,6 +650,85 @@ def test_work_register_body_encodes_controlled_phase():
     np.testing.assert_allclose(at_zero, identity_expected, atol=1e-10)
 
 
+def test_apply_kernel_two_work_qubit_chain_matches_dense_reference():
+    cccz_body = [
+        ("and_tt", 0, 1, 0),
+        ("and_wt", 0, 2, 1),
+        ("z_w", 1),
+        ("and_wt", 0, 2, 1),
+        ("and_tt", 0, 1, 0),
+    ]
+    encoding = LCUBlockEncoding(3, [0.6, 0.4], [[], cccz_body], mu=1)
+    assert encoding.num_select_work == 2
+
+    probabilities = encoding.preparation.table_probabilities
+    identity = np.eye(8, dtype=np.complex128)
+    cccz = identity.copy()
+    cccz[-1, -1] = -1.0
+    quantized = encoding.alpha * (probabilities[0] * identity +
+                                  probabilities[1] * cccz)
+    ket = random_ket(8, seed=41)
+    apply_u = encoding.apply_kernel()
+    num_ancilla = encoding.num_ancilla
+
+    @cudaq.kernel
+    def apply_from_state(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(num_ancilla)
+        apply_u(ancilla, system)
+
+    out = np.asarray(cudaq.get_state(apply_from_state, state_from(ket)))
+    block = out[:1 << encoding.num_system]
+    np.testing.assert_allclose(block * encoding.alpha,
+                               quantized @ ket,
+                               atol=1e-10)
+
+    work_start = (encoding.num_system + encoding.num_index +
+                  encoding.num_garbage)
+    work_mask = sum(1 << qubit
+                    for qubit in range(work_start, work_start +
+                                       encoding.num_select_work))
+    excited_work = (np.arange(out.size) & work_mask) != 0
+    np.testing.assert_allclose(out[excited_work], 0.0, atol=1e-10)
+
+
+def test_controlled_apply_wide_index_with_work_register():
+    terms = WORK_TERMS + [
+        (0.2, [("y", 0)], pauli_matrix({0: "y"}, NUM_SYSTEM)),
+        (-0.1, [("sign", )], np.eye(1 << NUM_SYSTEM, dtype=np.complex128)),
+    ]
+    encoding = LCUBlockEncoding(NUM_SYSTEM,
+                                [abs(coeff) for coeff, _, _ in terms],
+                                [body for _, body, _ in terms],
+                                mu=1)
+    assert encoding.num_index == 3
+    assert encoding.num_select_work == 1
+    assert encoding.num_garbage > 0
+
+    probabilities = encoding.preparation.table_probabilities
+    quantized = np.zeros((1 << NUM_SYSTEM, 1 << NUM_SYSTEM),
+                         dtype=np.complex128)
+    for index, (coeff, _, matrix) in enumerate(terms):
+        quantized += (encoding.alpha * probabilities[index] * np.sign(coeff) *
+                      matrix)
+    for index in range(len(terms), len(probabilities)):
+        quantized += (encoding.alpha * probabilities[index] *
+                      np.eye(1 << NUM_SYSTEM, dtype=np.complex128))
+
+    ket = random_ket(1 << NUM_SYSTEM, seed=37)
+    at_zero = np.array(
+        cudaq.get_state(_controlled_circuit(encoding, 0), state_from(ket)))
+    identity_expected = np.zeros_like(at_zero)
+    identity_expected[:1 << NUM_SYSTEM] = ket
+    np.testing.assert_allclose(at_zero, identity_expected, atol=1e-10)
+
+    at_one = np.array(
+        cudaq.get_state(_controlled_circuit(encoding, 1), state_from(ket)))
+    np.testing.assert_allclose(at_one[:1 << NUM_SYSTEM] * encoding.alpha,
+                               quantized @ ket,
+                               atol=1e-10)
+
+
 # ----------------------------------------------------------------------
 # 7. Factory-boundary validation raises loudly
 # ----------------------------------------------------------------------
@@ -551,6 +765,8 @@ def test_validation_raises():
         LCUBlockEncoding(NUM_SYSTEM, [1.0], [[("and_tt", 0, 1)]])
     with pytest.raises(ValueError, match="unknown"):
         LCUBlockEncoding(NUM_SYSTEM, [1.0], [[("cnot", 0, 1)]])
+    with pytest.raises(ValueError, match="expected a tuple"):
+        LCUBlockEncoding(NUM_SYSTEM, [1.0], [[None]])
     with pytest.raises(ValueError, match="non-negative integer"):
         LCUBlockEncoding(NUM_SYSTEM, [1.0], [[("z", -1)]])
     with pytest.raises(ValueError, match="non-negative integer"):
@@ -566,3 +782,28 @@ def test_validation_raises():
     spelled = LCUBlockEncoding(NUM_SYSTEM, [1.0], [[("y", 0), ("sign", )]],
                                mu=1)
     assert str(reduced.select_observable()) == str(spelled.select_observable())
+
+    cancelled = LCUBlockEncoding(NUM_SYSTEM, [1.0], [[("x", 0), ("x", 0)]],
+                                 num_select_work=1)
+    identity = LCUBlockEncoding(NUM_SYSTEM, [1.0], [[]], num_select_work=1)
+    assert cancelled.num_select_work == identity.num_select_work == 1
+    assert str(cancelled.select_observable()) == str(
+        identity.select_observable())
+
+
+def test_lcu_prepare_unprepare_hooks_restore_all_ancillas():
+    encoding = build_encoding(terms=SMALL_TERMS, n=1, mu=2)
+    prepare = encoding.prepare_kernel()
+    unprepare = encoding.unprepare_kernel()
+    num_ancilla = encoding.num_ancilla
+
+    @cudaq.kernel
+    def roundtrip():
+        ancilla = cudaq.qvector(num_ancilla)
+        prepare(ancilla)
+        unprepare(ancilla)
+
+    out = np.asarray(cudaq.get_state(roundtrip), dtype=np.complex128)
+    expected = np.zeros_like(out)
+    expected[0] = 1.0
+    np.testing.assert_allclose(out, expected, atol=1e-10)

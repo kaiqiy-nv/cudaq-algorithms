@@ -264,6 +264,283 @@ def test_opcode_semantics(opcode, operands, kind, refs, controlled, has_work):
                      f"wrong on input {regs}"))
 
 
+def test_controlled_no_work_multi_opcode_dispatch():
+    specs = [(opcode, operands, kind, refs)
+             for opcode, operands, kind, refs in _SPECS.values()
+             if opcode in (_BASE_OPS | _CONTROL_OPS)]
+    ops = [(opcode, *operands) for opcode, operands, _, _ in specs]
+    interp = _mint_interpreter(ops, controlled=True, has_work=False)
+    specs_by_opcode = {opcode: (kind, refs) for opcode, _, kind, refs in specs}
+
+    @cudaq.kernel
+    def run():
+        control = cudaq.qvector(1)
+        address = cudaq.qvector(2)
+        ladder = cudaq.qvector(2)
+        target = cudaq.qvector(2)
+        h(control[0])
+        for i in range(2):
+            h(address[i])
+            h(ladder[i])
+            h(target[i])
+        interp(control, address, ladder, target)
+
+    expected = np.zeros(1 << 7, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(1 << 7)
+    for initial in range(1 << 7):
+        regs = {
+            "c": initial & 1,
+            "a": (initial >> 1) & 3,
+            "l": (initial >> 3) & 3,
+            "t": (initial >> 5) & 3,
+            "w": 0,
+        }
+        phase = 1.0 + 0.0j
+        for opcode, _, _, _ in ops:
+            kind, refs = specs_by_opcode[opcode]
+            regs, gate_phase = _apply(kind, refs, regs)
+            phase *= gate_phase
+        output = regs["c"] + (regs["a"] << 1) + (regs["l"] << 3) + \
+            (regs["t"] << 5)
+        expected[output] = amplitude * phase
+
+    state = np.array(cudaq.get_state(run))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_plain_variant_dispatches_every_base_opcode():
+    offsets, num_qubits = _layout(False, False)
+
+    for name, (opcode, operands, kind, refs) in sorted(_SPECS.items()):
+        if opcode not in _BASE_OPS:
+            continue
+
+        harness = _mint_harness((opcode, *operands), False, False)
+        regs = {"c": 0, "a": 0, "l": 0, "t": 0, "w": 0}
+        for reg, index in refs:
+            regs[reg] |= 1 << index
+
+        state = np.array(
+            cudaq.get_state(harness, regs["a"], regs["l"], regs["t"]))
+        out, phase = _apply(kind, refs, regs)
+        expected = np.zeros(1 << num_qubits, dtype=np.complex128)
+        index = sum(out[reg] << off for reg, off in offsets.items())
+        expected[index] = phase
+        np.testing.assert_allclose(
+            state,
+            expected,
+            atol=1e-12,
+            err_msg=f"opcode {name} wrong on input {regs}")
+
+
+def test_plain_composite_target_dispatch_matches_reference():
+    names = ("free_x", "free_cx", "z_ladder", "cx_addr_addr", "ccx_addr_addr")
+    specs = [_SPECS[name] for name in names]
+    ops = [(opcode, *operands) for opcode, operands, _, _ in specs]
+    interp = _mint_interpreter(ops, controlled=False, has_work=False)
+
+    @cudaq.kernel
+    def run():
+        address = cudaq.qvector(2)
+        ladder = cudaq.qvector(2)
+        target = cudaq.qvector(2)
+        for i in range(2):
+            h(address[i])
+            h(ladder[i])
+            h(target[i])
+        interp(address, ladder, target)
+
+    offsets, num_qubits = _layout(False, False)
+    expected = np.zeros(1 << num_qubits, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(1 << num_qubits)
+    for initial in range(1 << num_qubits):
+        regs = {
+            reg: (initial >> offset) & ((1 << _WIDTHS[reg]) - 1)
+            for reg, offset in offsets.items()
+        }
+        phase = 1.0 + 0.0j
+        for _, _, kind, refs in specs:
+            regs, gate_phase = _apply(kind, refs, regs)
+            phase *= gate_phase
+        output_index = sum(regs[reg] << offset
+                           for reg, offset in offsets.items())
+        expected[output_index] += amplitude * phase
+
+    state = np.array(cudaq.get_state(run))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_targeted_controlled_work_tail_opcode_dispatch():
+    names = ("z_ladder", "cx_addr_addr", "ccx_addr_addr")
+    specs = [_SPECS[name] for name in names]
+    ops = [(opcode, *operands) for opcode, operands, _, _ in specs]
+    interp = _mint_interpreter(ops, controlled=True, has_work=True)
+
+    @cudaq.kernel
+    def run():
+        control = cudaq.qvector(1)
+        address = cudaq.qvector(2)
+        ladder = cudaq.qvector(2)
+        target = cudaq.qvector(2)
+        work = cudaq.qvector(2)
+        h(control[0])
+        for i in range(2):
+            h(address[i])
+            h(ladder[i])
+            h(target[i])
+            h(work[i])
+        interp(control, address, ladder, target, work)
+
+    offsets, num_qubits = _layout(True, True)
+    expected = np.zeros(1 << num_qubits, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(1 << num_qubits)
+    masks = {"c": 1, "a": 3, "l": 3, "t": 3, "w": 3}
+    for basis_index in range(1 << num_qubits):
+        regs = {
+            reg: (basis_index >> offset) & masks[reg]
+            for reg, offset in offsets.items()
+        }
+        phase = 1.0 + 0.0j
+        for _, _, kind, refs in specs:
+            regs, gate_phase = _apply(kind, refs, regs)
+            phase *= gate_phase
+        output_index = sum(regs[reg] << offset
+                           for reg, offset in offsets.items())
+        expected[output_index] += amplitude * phase
+
+    state = np.array(cudaq.get_state(run))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_composite_controlled_work_dispatch_matches_reference():
+    names = tuple(sorted(_SPECS))
+    tape = [(_SPECS[name][0], *_SPECS[name][1]) for name in names]
+    interp = _mint_interpreter(tape, controlled=True, has_work=True)
+    empty_interp = _mint_interpreter([], controlled=True, has_work=True)
+
+    @cudaq.kernel
+    def run():
+        control = cudaq.qvector(1)
+        address = cudaq.qvector(2)
+        ladder = cudaq.qvector(2)
+        target = cudaq.qvector(2)
+        work = cudaq.qvector(2)
+        h(control[0])
+        for i in range(2):
+            h(address[i])
+            h(ladder[i])
+            h(target[i])
+            h(work[i])
+        interp(control, address, ladder, target, work)
+        empty_interp(control, address, ladder, target, work)
+
+    offsets, num_qubits = _layout(True, True)
+    expected = np.zeros(1 << num_qubits, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(1 << num_qubits)
+    masks = {"c": 1, "a": 3, "l": 3, "t": 3, "w": 3}
+    for basis_index in range(1 << num_qubits):
+        regs = {
+            reg: (basis_index >> offset) & masks[reg]
+            for reg, offset in offsets.items()
+        }
+        phase = 1.0 + 0.0j
+        for name in names:
+            _, _, kind, refs = _SPECS[name]
+            regs, gate_phase = _apply(kind, refs, regs)
+            phase *= gate_phase
+        output_index = sum(regs[reg] << offset
+                           for reg, offset in offsets.items())
+        expected[output_index] += amplitude * phase
+
+    state = np.array(cudaq.get_state(run))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_composite_uncontrolled_work_dispatch_matches_reference():
+    names = [
+        name for name, (opcode, _, _, _) in sorted(_SPECS.items())
+        if opcode in (_BASE_OPS | _WORK_OPS)
+    ]
+    tape = [(_SPECS[name][0], *_SPECS[name][1]) for name in names]
+    interp = _mint_interpreter(tape, controlled=False, has_work=True)
+
+    @cudaq.kernel
+    def run():
+        address = cudaq.qvector(2)
+        ladder = cudaq.qvector(2)
+        target = cudaq.qvector(2)
+        work = cudaq.qvector(2)
+        for i in range(2):
+            h(address[i])
+            h(ladder[i])
+            h(target[i])
+            h(work[i])
+        interp(address, ladder, target, work)
+
+    offsets, num_qubits = _layout(False, True)
+    expected = np.zeros(1 << num_qubits, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(1 << num_qubits)
+    masks = {"a": 3, "l": 3, "t": 3, "w": 3}
+    for basis_index in range(1 << num_qubits):
+        regs = {
+            reg: (basis_index >> offset) & masks[reg]
+            for reg, offset in offsets.items()
+        }
+        phase = 1.0 + 0.0j
+        for name in names:
+            _, _, kind, refs = _SPECS[name]
+            regs, gate_phase = _apply(kind, refs, regs)
+            phase *= gate_phase
+        output_index = sum(regs[reg] << offset
+                           for reg, offset in offsets.items())
+        expected[output_index] += amplitude * phase
+
+    state = np.array(cudaq.get_state(run))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_composite_work_dispatch_matches_reference():
+    specs = [(opcode, operands, kind, refs)
+             for opcode, operands, kind, refs in _SPECS.values()
+             if opcode in (_BASE_OPS | _WORK_OPS)]
+    ops = [(opcode, *operands) for opcode, operands, _, _ in specs]
+    interp = _mint_interpreter(ops, controlled=False, has_work=True)
+    specs_by_opcode = {opcode: (kind, refs) for opcode, _, kind, refs in specs}
+
+    @cudaq.kernel
+    def run():
+        address = cudaq.qvector(2)
+        ladder = cudaq.qvector(2)
+        target = cudaq.qvector(2)
+        work = cudaq.qvector(2)
+        for i in range(2):
+            h(address[i])
+            h(ladder[i])
+            h(target[i])
+            h(work[i])
+        interp(address, ladder, target, work)
+
+    offsets, num_qubits = _layout(False, True)
+    expected = np.zeros(1 << num_qubits, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(1 << num_qubits)
+    for initial in range(1 << num_qubits):
+        regs = {
+            reg: (initial >> offset) & ((1 << _WIDTHS[reg]) - 1)
+            for reg, offset in offsets.items()
+        }
+        phase = 1.0 + 0.0j
+        for opcode, _, _, _ in specs:
+            kind, refs = specs_by_opcode[opcode]
+            regs, gate_phase = _apply(kind, refs, regs)
+            phase *= gate_phase
+        output_index = sum(regs[reg] << offset
+                           for reg, offset in offsets.items())
+        expected[output_index] += amplitude * phase
+
+    state = np.array(cudaq.get_state(run))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
 def test_mint_rejects_out_of_set_opcodes():
     # A work opcode on a no-work tape (and a control opcode on an
     # uncontrolled tape) must be a loud mint-time error: the dispatch

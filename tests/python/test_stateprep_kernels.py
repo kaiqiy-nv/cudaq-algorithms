@@ -25,6 +25,7 @@ import cudaq
 import cudaq_algorithms as algorithms
 
 from dense_references import dense_matrix
+from cudaq_algorithms.stateprep._kernels import _ordered_double_excitation
 
 # ----------------------------------------------------------------------------
 # Entry kernels
@@ -38,6 +39,15 @@ def _uccsd_entry(num_qubits: int, occupied: list[int], thetas: list[float],
     for i in range(len(occupied)):
         x(q[occupied[i]])
     algorithms.stateprep.uccsd(q, thetas, num_electrons, spin)
+
+
+@cudaq.kernel
+def _single_excitation_entry(num_qubits: int, occupied: list[int],
+                             theta: float, p_occ: int, q_virt: int):
+    q = cudaq.qvector(num_qubits)
+    for i in range(len(occupied)):
+        x(q[occupied[i]])
+    algorithms.stateprep.single_excitation(q, theta, p_occ, q_virt)
 
 
 @cudaq.kernel
@@ -152,9 +162,11 @@ def _assert_close(actual, reference):
     # (10, 5, 1) is open-shell (spin>0) and large enough to emit same-spin
     # alpha *and* beta doubles (3 each) -- the occupancy split the smaller
     # (6, 3, 1) case leaves empty.
+    # (8, 3, 3) is fully alpha-polarized, with no occupied beta orbitals.
     # (8, 4, 2) interleaves the occupied alpha and virtual beta indices; the
     # assertion below checks that the direct circuit still matches the pool.
-    [(4, 2, 0), (6, 2, 0), (6, 3, 1), (8, 4, 0), (10, 5, 1), (8, 4, 2)])
+    [(4, 2, 0), (6, 2, 0), (6, 3, 1), (8, 4, 0), (10, 5, 1), (8, 4, 2),
+     (8, 3, 3)])
 def test_uccsd_kernel_matches_dense_exponential(num_qubits, num_electrons,
                                                 spin, angles):
     pool = algorithms.stateprep.make_uccsd_operator_pool(
@@ -173,6 +185,43 @@ def test_uccsd_kernel_matches_dense_exponential(num_qubits, num_electrons,
                                          _hf_ket(num_qubits, occupation),
                                          scale=-0.5)
     _assert_close(actual, reference)
+
+
+def test_single_excitation_matches_dense_exponential():
+    num_qubits, num_electrons, spin = 6, 2, 0
+    excitation = [0, 4]
+    theta = 0.4
+    excitations = algorithms.stateprep.get_uccsd_excitations(
+        num_qubits, num_electrons, spin)
+    pool = algorithms.stateprep.make_uccsd_operator_pool(
+        num_qubits, num_electrons, spin)
+    excitation_index = excitations[0].index(excitation)
+    occupation = _hf_occupation(num_electrons, spin)
+
+    actual = _state(_single_excitation_entry, num_qubits, occupation, theta,
+                    *excitation)
+    reference = _dense_product_reference(
+        [_pool_term_groups(pool, num_qubits)[excitation_index]], [theta],
+        num_qubits,
+        _hf_ket(num_qubits, occupation),
+        scale=-0.5)
+    _assert_close(actual, reference)
+
+
+def test_uccsd_single_amplitude_exercises_nested_excitation_loops():
+    num_qubits, num_electrons, spin = 10, 6, 0
+    theta = 0.4
+    parameter_count = algorithms.stateprep.get_num_uccsd_parameters(
+        num_qubits, num_electrons, spin)
+    thetas = [0.0] * parameter_count
+    thetas[0] = theta
+    occupation = _hf_occupation(num_electrons, spin)
+
+    actual = _state(_uccsd_entry, num_qubits, occupation, thetas,
+                    num_electrons, spin)
+    expected = _state(_single_excitation_entry, num_qubits, occupation, theta,
+                      0, 6)
+    _assert_close(actual, expected)
 
 
 def test_uccsd_interleaved_mixed_double_matches_dense_exponential():
@@ -199,6 +248,50 @@ def test_uccsd_interleaved_mixed_double_matches_dense_exponential():
     _assert_close(actual, reference)
 
 
+def test_uccsd_spaced_open_shell_mixed_double_matches_dense_exponential():
+    num_qubits, num_electrons, spin = 10, 4, 2
+    excitations = algorithms.stateprep.get_uccsd_excitations(
+        num_qubits, num_electrons, spin)
+    pool = algorithms.stateprep.make_uccsd_operator_pool(
+        num_qubits, num_electrons, spin)
+    mixed_offset = len(excitations[0]) + len(excitations[1])
+    parameter_index = mixed_offset + excitations[2].index([4, 1, 3, 8])
+    thetas = [0.0] * len(pool)
+    thetas[parameter_index] = 0.4
+    occupation = _hf_occupation(num_electrons, spin)
+
+    actual = _state(_uccsd_entry, num_qubits, occupation, thetas,
+                    num_electrons, spin)
+    reference = _dense_product_reference(_pool_term_groups(pool, num_qubits),
+                                         thetas,
+                                         num_qubits,
+                                         _hf_ket(num_qubits, occupation),
+                                         scale=-0.5)
+    _assert_close(actual, reference)
+
+
+def test_uccsd_spaced_alpha_double_matches_dense_exponential():
+    num_qubits, num_electrons, spin = 8, 4, 0
+    excitations = algorithms.stateprep.get_uccsd_excitations(
+        num_qubits, num_electrons, spin)
+    pool = algorithms.stateprep.make_uccsd_operator_pool(
+        num_qubits, num_electrons, spin)
+    double_offset = sum(len(group) for group in excitations[:3])
+    parameter_index = double_offset + excitations[3].index([0, 2, 4, 6])
+    thetas = [0.0] * len(pool)
+    thetas[parameter_index] = 0.4
+    occupation = _hf_occupation(num_electrons, spin)
+
+    actual = _state(_uccsd_entry, num_qubits, occupation, thetas,
+                    num_electrons, spin)
+    reference = _dense_product_reference(_pool_term_groups(pool, num_qubits),
+                                         thetas,
+                                         num_qubits,
+                                         _hf_ket(num_qubits, occupation),
+                                         scale=-0.5)
+    _assert_close(actual, reference)
+
+
 @pytest.mark.parametrize("num_qubits", [4, 6])
 def test_uccgsd_kernel_matches_dense_exponential(num_qubits):
     words, coeffs = algorithms.stateprep.get_uccgsd_pauli_lists(num_qubits)
@@ -210,6 +303,25 @@ def test_uccgsd_kernel_matches_dense_exponential(num_qubits):
     actual = _state(_uccgsd_entry, num_qubits, occupation, thetas, words,
                     coeffs)
     reference = _dense_product_reference(term_groups, thetas, num_qubits,
+                                         _hf_ket(num_qubits, occupation))
+    _assert_close(actual, reference)
+
+
+def test_uccgsd_minimal_single_matches_dense_exponential():
+    num_qubits = 2
+    words, coeffs = algorithms.stateprep.get_uccgsd_pauli_lists(
+        num_qubits, only_singles=True)
+    pool = algorithms.stateprep.make_uccgsd_operator_pool(num_qubits,
+                                                          only_singles=True)
+    assert len(words) == len(coeffs) == 1
+    assert len(words[0]) == len(coeffs[0]) == 2
+
+    thetas = [0.37]
+    occupation = [0]
+    actual = _state(_uccgsd_entry, num_qubits, occupation, thetas, words,
+                    coeffs)
+    reference = _dense_product_reference(_pool_term_groups(pool, num_qubits),
+                                         thetas, num_qubits,
                                          _hf_ket(num_qubits, occupation))
     _assert_close(actual, reference)
 
@@ -229,6 +341,31 @@ def test_upccgsd_kernel_matches_dense_exponential(num_qubits):
     _assert_close(actual, reference)
 
 
+def test_upccgsd_kernel_empty_and_zero_term_groups():
+    num_qubits = 4
+    occupation = list(range(num_qubits // 2))
+    hf_ket = _hf_ket(num_qubits, occupation)
+
+    actual = _state(_upccgsd_entry, num_qubits, occupation, [], [], [])
+    _assert_close(actual, hf_ket)
+
+    words, coeffs = algorithms.stateprep.get_upccgsd_pauli_lists(num_qubits)
+    pool = algorithms.stateprep.make_upccgsd_operator_pool(num_qubits)
+    term_groups = _pool_term_groups(pool, num_qubits)
+    thetas = [0.2 + 0.01 * index for index in range(len(words))]
+    words = [list(group) for group in words]
+    coeffs = [list(group) for group in coeffs]
+    words[0] = []
+    coeffs[0] = []
+    term_groups[0] = []
+
+    actual = _state(_upccgsd_entry, num_qubits, occupation, thetas, words,
+                    coeffs)
+    reference = _dense_product_reference(term_groups, thetas, num_qubits,
+                                         hf_ket)
+    _assert_close(actual, reference)
+
+
 # num_orbitals = 4 is the smallest size with same-spin doubles
 # (they need four descending spatial orbitals).
 @pytest.mark.parametrize("num_orbitals", [2, 3, 4])
@@ -243,6 +380,29 @@ def test_ceo_kernel_matches_dense_exponential(num_orbitals):
     actual = _state(_ceo_entry, num_qubits, occupation, thetas, words, coeffs)
     reference = _dense_product_reference(term_groups, thetas, num_qubits,
                                          _hf_ket(num_qubits, occupation))
+    _assert_close(actual, reference)
+
+
+def test_ceo_kernel_empty_and_nonempty_groups_match_dense():
+    num_qubits = 4
+    occupation = list(range(num_qubits // 2))
+    hf_ket = _hf_ket(num_qubits, occupation)
+
+    actual = _state(_ceo_entry, num_qubits, occupation, [], [], [])
+    _assert_close(actual, hf_ket)
+
+    words, coeffs = algorithms.stateprep.get_ceo_pauli_lists(2)
+    pool = algorithms.stateprep.make_ceo_operator_pool(2)
+    term_groups = _pool_term_groups(pool, num_qubits)
+    thetas = [0.3, 0.4]
+    grouped_words = [[], list(words[0])]
+    grouped_coeffs = [[], list(coeffs[0])]
+    grouped_terms = [[], term_groups[0]]
+
+    actual = _state(_ceo_entry, num_qubits, occupation, thetas, grouped_words,
+                    grouped_coeffs)
+    reference = _dense_product_reference(grouped_terms, thetas, num_qubits,
+                                         hf_ket)
     _assert_close(actual, reference)
 
 
@@ -316,15 +476,76 @@ def _one_double_entry(theta: float, p_occ: int, q_occ: int, r_virt: int,
                                            s_virt)
 
 
-def test_double_excitation_negates_one_index_swap():
-    # Swapping one pair sends tau = adag_r adag_s a_q a_p - h.c. to -tau.
-    # The ladder must keep that minus: +theta on the H2 order [0, 1, 3, 2]
-    # is -theta on the sorted order [0, 1, 2, 3]. The pool applies the
-    # same minus, so both APIs stay antisymmetric.
+@cudaq.kernel
+def _ordered_double_entry(theta: float, p_occ: int, q_occ: int, r_virt: int,
+                          s_virt: int):
+    qubits = cudaq.qvector(4)
+    x(qubits[0])
+    x(qubits[1])
+    _ordered_double_excitation(qubits, theta, p_occ, q_occ, r_virt, s_virt)
+
+
+@cudaq.kernel
+def _gapped_double_entry(theta: float, p_occ: int, q_occ: int, r_virt: int,
+                         s_virt: int):
+    qubits = cudaq.qvector(8)
+    x(qubits[0])
+    x(qubits[2])
+    algorithms.stateprep.double_excitation(qubits, theta, p_occ, q_occ, r_virt,
+                                           s_virt)
+
+
+@pytest.mark.parametrize("p_occ,q_occ,r_virt,s_virt,sign",
+                         [(0, 1, 2, 3, 1.0), (1, 0, 3, 2, 1.0),
+                          (0, 1, 3, 2, -1.0), (1, 0, 2, 3, -1.0)])
+def test_double_excitation_normalizes_index_order(p_occ, q_occ, r_virt, s_virt,
+                                                  sign):
+    # Reversing exactly one pair negates the excitation generator.
     theta = 0.4
-    swapped = _state(_one_double_entry, theta, 0, 1, 3, 2)
-    ordered = _state(_one_double_entry, -theta, 0, 1, 2, 3)
+    actual = _state(_one_double_entry, theta, p_occ, q_occ, r_virt, s_virt)
+    ordered = _state(_one_double_entry, sign * theta, 0, 1, 2, 3)
     # Same state, not merely the same probabilities: the relative phase
     # between the Hartree-Fock determinant and the double excitation is
     # the correlation sign.
-    _assert_close(swapped, ordered)
+    _assert_close(actual, ordered)
+
+
+@pytest.mark.parametrize(
+    "indices,effective_sign",
+    [
+        pytest.param((0, 2, 4, 6), 1.0, id="ordered"),
+        pytest.param((2, 0, 4, 6), -1.0, id="occupied-pair-reversed"),
+        pytest.param((0, 2, 6, 4), -1.0, id="virtual-pair-reversed"),
+        pytest.param((2, 0, 6, 4), 1.0, id="both-pairs-reversed"),
+    ],
+)
+def test_double_excitation_ordered_permutations_preserve_state(
+        indices, effective_sign):
+    theta = 0.4
+    actual = _state(_gapped_double_entry, theta, *indices)
+    canonical = _state(_gapped_double_entry, effective_sign * theta, 0, 2, 4,
+                       6)
+    _assert_close(actual, canonical)
+
+
+@pytest.mark.parametrize(
+    "indices,effective_sign",
+    [
+        pytest.param((0, 1, 2, 3), 1.0, id="ordered"),
+        pytest.param((1, 0, 3, 2), 1.0, id="both-pairs-reversed"),
+        pytest.param((1, 0, 2, 3), -1.0, id="occupied-pair-reversed"),
+        pytest.param((0, 1, 3, 2), -1.0, id="virtual-pair-reversed"),
+    ],
+)
+def test_ordered_double_excitation_matches_dense_for_index_orderings(
+        indices, effective_sign):
+    theta = 0.4
+    actual = _state(_ordered_double_entry, theta, *indices)
+
+    pool = algorithms.stateprep.make_uccsd_operator_pool(4, 2, 0)
+    reference = _dense_product_reference(_pool_term_groups(pool, 4),
+                                         [0.0, 0.0, -effective_sign * theta],
+                                         4,
+                                         _hf_ket(4, [0, 1]),
+                                         scale=-0.5)
+    _assert_close(actual, reference)

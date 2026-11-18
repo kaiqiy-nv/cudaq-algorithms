@@ -134,6 +134,60 @@ def test_cholesky_and_eigendecomposition_agree(backend):
                                atol=1.0e-9)
 
 
+def test_explicit_double_factorization_rejects_invalid_dispatch_options():
+    eri = _synthetic_eri(n=2, num_vectors=1, seed=17)
+    with pytest.raises(ValueError):
+        df.explicit_double_factorization(eri,
+                                         first_factorization="unsupported",
+                                         backend="numpy")
+    with pytest.raises(ValueError):
+        df.explicit_double_factorization(eri, backend="unknown")
+
+    factorization = df.explicit_double_factorization(
+        eri,
+        first_factorization="eigendecomposition",
+        max_num_leaves=0,
+        backend="numpy")
+    assert factorization.num_leaves == 0
+
+
+def test_initial_generators_fallback_and_padding(monkeypatch):
+    from cudaq_algorithms.double_factorization import _factorization
+
+    reflection = np.diag([1.0, -1.0])
+
+    def return_reflection(*args, **kwargs):
+        return df.DoubleFactorization(num_orbitals=2,
+                                      leaf_rotations=[reflection],
+                                      leaf_cores=[],
+                                      method="X-DF")
+
+    monkeypatch.setattr(_factorization, "explicit_double_factorization",
+                        return_reflection)
+    generators = _factorization._initial_generators(_synthetic_eri(
+        n=2, num_vectors=1, seed=19),
+                                                    num_leaves=2,
+                                                    n=2,
+                                                    backend="numpy")
+
+    assert len(generators) == 2
+    np.testing.assert_array_equal(generators[0], np.zeros((2, 2)))
+    np.testing.assert_array_equal(generators[1], np.zeros((2, 2)))
+
+
+def test_compressed_double_factorization_builds_initial_generators():
+    eri = _synthetic_eri(n=2, num_vectors=2, seed=23)
+    factorization = df.compressed_double_factorization(eri,
+                                                       num_leaves=1,
+                                                       backend="numpy")
+
+    assert factorization.num_leaves == 1
+    assert all(
+        np.isfinite(array).all() for array in (*factorization.leaf_rotations,
+                                               *factorization.leaf_cores))
+    assert np.isfinite(factorization.reconstruct_eri()).all()
+
+
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_compressed_double_factorization_beats_explicit(backend):
     eri = _synthetic_eri(n=4, num_vectors=3, seed=7)
@@ -250,6 +304,28 @@ def test_cg_exact_at_true_rank_and_rejects_unknown_solver(backend):
                                            num_leaves=2,
                                            inner_solver="bogus",
                                            backend=backend)
+
+
+def test_inner_core_solver_guards(monkeypatch):
+    import cudaq_algorithms.double_factorization._factorization as F
+
+    eri_dev = np.zeros((1, 1, 1, 1))
+    rotations = [np.eye(1), np.eye(1)]
+    projected_rhs = iter((np.ones((1, 1)), -np.ones((1, 1))))
+    monkeypatch.setattr(F, "_project_eri_into_leaf",
+                        lambda eri, rotation, xp: next(projected_rhs))
+
+    cores = F._solve_inner_cores_cg(eri_dev,
+                                    rotations,
+                                    np,
+                                    tolerance=0.0,
+                                    max_iterations=1)
+    for core in cores:
+        np.testing.assert_array_equal(core, np.zeros((1, 1)))
+
+    with pytest.raises(ValueError,
+                       match="inner_solver must be 'lstsq' or 'cg'"):
+        F._solve_inner_cores(eri_dev, rotations, np, solver="unsupported")
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
@@ -708,6 +784,30 @@ def test_cupy_gpu_available_requires_a_working_kernel(monkeypatch):
     # Enumeration is not enough: a kernel must run.
     import cudaq_algorithms.double_factorization._backend as B
     _enumerating_but_dead_cupy(monkeypatch)
+    assert B.cupy_gpu_available() is False
+
+
+def test_cupy_gpu_available_handles_missing_cupy_and_no_devices(monkeypatch):
+    import cudaq_algorithms.double_factorization._backend as B
+
+    monkeypatch.setattr(B, "_cupy", None)
+    assert B.cupy_gpu_available() is False
+
+    class _NoDeviceCuPy:
+
+        class cuda:
+
+            class runtime:
+
+                @staticmethod
+                def getDeviceCount():
+                    return 0
+
+        @staticmethod
+        def arange(*args, **kwargs):
+            pytest.fail("kernel probe should not run without a device")
+
+    monkeypatch.setattr(B, "_cupy", _NoDeviceCuPy)
     assert B.cupy_gpu_available() is False
 
 

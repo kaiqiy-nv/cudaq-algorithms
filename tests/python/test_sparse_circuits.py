@@ -172,6 +172,8 @@ def _oracle_probe(oracles, num_system, slot, row, which):
         elif which == 1:
             o_loc(s, x_reg, work)
             o_loc_adj(s, x_reg, work)
+        elif which == 3:
+            o_loc_adj(s, x_reg, work)
         else:
             o_val(s, x_reg, value, work)
 
@@ -215,6 +217,91 @@ def test_qrom_location_oracle_maps_rows_and_inverts():
                                                0), (slot, row)
             s, x_out, value, work = _oracle_probe(oracles, 2, slot, row, 1)
             assert (s, x_out, value, work) == (slot, row, 0, 0), (slot, row)
+
+
+def test_qrom_diagonal_location_oracle_is_identity():
+    oracles = qrom_oracles(SHAPES["diag4"], VB)
+    assert oracles.d == 1
+    num_system = 2
+    slot_bits = max(1, (oracles.d - 1).bit_length())
+    num_work = oracles.num_work
+    ket = random_ket(1 << (slot_bits + num_system), seed=41)
+    o_loc = oracles.o_loc
+
+    @cudaq.kernel
+    def probe(state: cudaq.State):
+        registers = cudaq.qvector(state)
+        slot = registers.front(slot_bits)
+        system = registers[slot_bits:slot_bits + num_system]
+        work = cudaq.qvector(num_work)
+        o_loc(slot, system, work)
+
+    output = np.asarray(cudaq.get_state(probe, state_from(ket)))
+    expected = np.zeros(1 << (slot_bits + num_system + num_work),
+                        dtype=np.complex128)
+    expected[:ket.size] = ket
+    np.testing.assert_allclose(output, expected, atol=1e-10)
+
+
+def test_diagonal_only_qrom_location_oracle_is_identity():
+    matrix = np.diag([0.3, 0.0, 0.9, 0.5])
+    oracles = qrom_oracles(matrix, VB)
+    assert oracles.d == 1
+
+    slot_bits = 1
+    num_system = 2
+    data_width = slot_bits + num_system
+    num_work = oracles.num_work
+    ket = random_ket(1 << data_width, seed=53)
+    o_loc, o_loc_adj = oracles.o_loc, oracles.o_loc_adj
+
+    @cudaq.kernel
+    def probe(state: cudaq.State):
+        registers = cudaq.qvector(state)
+        slot = registers.front(slot_bits)
+        system = registers[slot_bits:slot_bits + num_system]
+        work = cudaq.qvector(num_work)
+        o_loc(slot, system, work)
+        o_loc_adj(slot, system, work)
+
+    output = np.asarray(cudaq.get_state(probe, state_from(ket)))
+    expected = np.zeros(1 << (data_width + num_work), dtype=np.complex128)
+    expected[:ket.size] = ket
+    np.testing.assert_allclose(output, expected, atol=1e-10)
+
+
+def test_qrom_location_oracle_uses_three_bit_slot_decode():
+    matrix = np.zeros((6, 6))
+    matrix[0, 1:] = 1.0
+    matrix[1:, 0] = 1.0
+    oracles = qrom_oracles(matrix, VB)
+    assert oracles.d == 5
+    o_loc = oracles.o_loc
+    o_loc_adj = oracles.o_loc_adj
+    num_work = oracles.num_work
+
+    @cudaq.kernel
+    def probe_forward():
+        slot = cudaq.qvector(3)
+        system = cudaq.qvector(3)
+        work = cudaq.qvector(num_work)
+        x(slot[2])
+        o_loc(slot, system, work)
+
+    @cudaq.kernel
+    def probe_adjoint():
+        slot = cudaq.qvector(3)
+        system = cudaq.qvector(3)
+        work = cudaq.qvector(num_work)
+        x(slot[2])
+        x(system[0])
+        x(system[2])
+        o_loc_adj(slot, system, work)
+
+    forward = cudaq.get_state(probe_forward)
+    assert basis_registers(forward, [3, 3, num_work]) == [4, 5, 0]
+    adjoint = cudaq.get_state(probe_adjoint)
+    assert basis_registers(adjoint, [3, 3, num_work]) == [4, 0, 0]
 
 
 def test_qrom_value_oracle_loads_assigned_entries_only():
@@ -281,6 +368,198 @@ def test_banded_oracles_clip_at_the_boundary_and_skip_padded_slots():
         assert _oracle_probe(oracles, 3, 0, row, 0)[1] == (row + 1) % 8
         assert _oracle_probe(oracles, 3, 1, row, 0)[1] == (row - 1) % 8
         assert _oracle_probe(oracles, 3, 0, row, 1)[1] == row
+
+
+def test_banded_location_adjoint_maps_each_slot_and_skips_padding():
+    offsets = [1, -1, 0]
+    oracles = banded_oracles(offsets, [0.5, 0.5, 0.25],
+                             num_system=2,
+                             value_bits=VB)
+    assert oracles.d == 3
+
+    dimension = 1 << 2
+    slot_offsets = [1, -1, 0, 0]
+    for slot, offset in enumerate(slot_offsets):
+        for row in range(dimension):
+            expected_row = (row - offset) % dimension
+            slot_out, system_out, value_out, work_out = _oracle_probe(
+                oracles, 2, slot, row, 3)
+            assert (slot_out, system_out, value_out,
+                    work_out) == (slot, expected_row, 0, 0), (slot, row)
+
+
+def test_banded_location_oracle_handles_three_bit_slots():
+    offsets = [2, -1, 0, -2, 1]
+    values = [0.5, 0.25, 0.75, 0.375, 0.125]
+    num_system = 3
+    dimension = 1 << num_system
+    oracles = banded_oracles(offsets,
+                             values,
+                             num_system=num_system,
+                             value_bits=VB,
+                             hermitian=False)
+    assert oracles.d == 5
+
+    cases = [(0, 7), (1, 0), (2, 3), (3, 0), (4, 7), (5, 1), (6, 4), (7, 7)]
+    for slot, row in cases:
+        offset = offsets[slot] if slot < len(offsets) else 0
+        expected = (row + offset) % dimension
+        slot_out, system_out, value_out, work_out = _oracle_probe(
+            oracles, num_system, slot, row, 0)
+        assert (slot_out, system_out, value_out,
+                work_out) == (slot, expected, 0, 0), (slot, row)
+
+    slot_out, system_out, value_out, work_out = _oracle_probe(
+        oracles, num_system, 3, 0, 1)
+    assert (slot_out, system_out, value_out, work_out) == (3, 0, 0, 0)
+
+
+def test_banded_value_oracle_loads_signed_nonhermitian_bands():
+    offsets = [2, -1, 0]
+    values = [0.5, -0.25, 0.125]
+    num_system = 3
+    dimension = 1 << num_system
+    oracles = banded_oracles(offsets,
+                             values,
+                             num_system=num_system,
+                             value_bits=VB,
+                             hermitian=False)
+    assert oracles.d == 3
+    value_bits = oracles.value_bits
+
+    for slot, (offset, band_value) in enumerate(zip(offsets, values)):
+        expected = quantized_angle(band_value, oracles.h, value_bits)
+        if band_value < 0.0:
+            expected |= 1 << value_bits
+        for row in range(dimension):
+            valid = (offset == 0 or (offset > 0 and row >= offset)
+                     or (offset < 0 and row < dimension + offset))
+            slot_out, system_out, value_out, work_out = _oracle_probe(
+                oracles, num_system, slot, row, 2)
+            assert (slot_out, system_out, work_out) == (slot, row, 0)
+            assert value_out == (expected if valid else 0), (slot, row)
+
+    for row in range(dimension):
+        slot_out, system_out, value_out, work_out = _oracle_probe(
+            oracles, num_system, 3, row, 2)
+        assert (slot_out, system_out, value_out, work_out) == (3, row, 0, 0)
+
+
+def test_banded_value_oracle_coherent_slot_roundtrip():
+    offsets = [1, -1, 0]
+    values = [0.375, -0.25, 0.5]
+    num_system = 2
+    slot_bits = 2
+    system_bits = num_system
+    value_width = VB + 2
+    dimension = 1 << num_system
+    oracles = banded_oracles(offsets,
+                             values,
+                             num_system=num_system,
+                             value_bits=VB,
+                             hermitian=False)
+    assert oracles.d == 3
+
+    work_width = max(1, oracles.num_work)
+    work_dimension = 1 << work_width
+    data_width = slot_bits + system_bits + value_width
+    data_dimension = 1 << data_width
+    state_dimension = data_dimension * work_dimension
+    expected = np.zeros(state_dimension, dtype=np.complex128)
+    initial = np.zeros(state_dimension, dtype=np.complex128)
+    band_words = []
+    for band_value in values:
+        word = quantized_angle(band_value, oracles.h, VB)
+        if band_value < 0.0:
+            word |= 1 << VB
+        band_words.append(word)
+
+    for slot in range(4):
+        for row in range(dimension):
+            data_index = slot | (row << slot_bits)
+            initial[data_index] = 0.25
+            if slot >= oracles.d:
+                word = 0
+            else:
+                offset = offsets[slot]
+                valid = (offset == 0 or (offset > 0 and row >= offset)
+                         or (offset < 0 and row < dimension + offset))
+                word = band_words[slot] if valid else 0
+            expected[data_index | (word << (slot_bits + system_bits))] = 0.25
+
+    o_val = oracles.o_val
+    o_val_adj = oracles.o_val_adj
+
+    @cudaq.kernel
+    def prepare_and_load():
+        slot = cudaq.qvector(slot_bits)
+        system = cudaq.qvector(system_bits)
+        value = cudaq.qvector(value_width)
+        work = cudaq.qvector(work_width)
+        for bit in range(slot_bits):
+            h(slot[bit])
+        for bit in range(system_bits):
+            h(system[bit])
+        o_val(slot, system, value, work)
+
+    @cudaq.kernel
+    def prepare_load_and_uncompute():
+        slot = cudaq.qvector(slot_bits)
+        system = cudaq.qvector(system_bits)
+        value = cudaq.qvector(value_width)
+        work = cudaq.qvector(work_width)
+        for bit in range(slot_bits):
+            h(slot[bit])
+        for bit in range(system_bits):
+            h(system[bit])
+        o_val(slot, system, value, work)
+        o_val_adj(slot, system, value, work)
+
+    loaded = np.asarray(cudaq.get_state(prepare_and_load))
+    np.testing.assert_allclose(loaded, expected, atol=1e-10)
+    np.testing.assert_allclose(loaded.reshape(work_dimension,
+                                              data_dimension)[1:],
+                               0.0,
+                               atol=1e-10)
+
+    restored = np.asarray(cudaq.get_state(prepare_load_and_uncompute))
+    np.testing.assert_allclose(restored, initial, atol=1e-10)
+    np.testing.assert_allclose(restored.reshape(work_dimension,
+                                                data_dimension)[1:],
+                               0.0,
+                               atol=1e-10)
+
+
+def test_banded_value_oracle_handles_three_bit_slots():
+    offsets = [1, -1, 2, -2, 0]
+    values = [0.25, -0.375, 0.5, -0.125, 0.625]
+    num_system = 2
+    dimension = 1 << num_system
+    oracles = banded_oracles(offsets,
+                             values,
+                             num_system=num_system,
+                             value_bits=VB,
+                             hermitian=False)
+    assert oracles.d == 5
+
+    cases = [(0, 0), (0, 1), (1, 2), (1, 3), (2, 1), (2, 2), (3, 1), (3, 2),
+             (4, 3)]
+    for slot, row in cases:
+        offset = offsets[slot]
+        band_value = values[slot]
+        expected = quantized_angle(band_value, oracles.h, oracles.value_bits)
+        if band_value < 0.0:
+            expected |= 1 << oracles.value_bits
+        valid = (offset == 0 or (offset > 0 and row >= offset)
+                 or (offset < 0 and row < dimension + offset))
+        slot_out, system_out, value_out, work_out = _oracle_probe(
+            oracles, num_system, slot, row, 2)
+        assert (slot_out, system_out, work_out) == (slot, row, 0)
+        assert value_out == (expected if valid else 0), (slot, row)
+
+    slot_out, system_out, value_out, work_out = _oracle_probe(
+        oracles, num_system, 7, 0, 2)
+    assert (slot_out, system_out, value_out, work_out) == (7, 0, 0, 0)
 
 
 # ----------------------------------------------------------------------
@@ -435,6 +714,67 @@ def test_dilation_with_padded_slots_and_signed_input():
                                         ket),
                                scaled @ ket,
                                atol=1e-10)
+
+
+def test_dilated_location_adjoint_coherent_roundtrip():
+    encoding, _, _ = _dilation_case()
+    oracles = encoding.oracles
+    slot_bits = 2
+    system_bits = encoding.num_system
+    work_width = max(1, oracles.num_work)
+    data_width = slot_bits + system_bits
+    ket = random_ket(1 << data_width, seed=37)
+    half_width = 1 << (data_width - 1)
+    assert np.any(np.abs(ket[:half_width]) > 0.0)
+    assert np.any(np.abs(ket[half_width:]) > 0.0)
+    o_loc = oracles.o_loc
+    o_loc_adj = oracles.o_loc_adj
+
+    @cudaq.kernel
+    def roundtrip(state: cudaq.State):
+        registers = cudaq.qvector(state)
+        slot = registers.front(slot_bits)
+        system = registers[slot_bits:slot_bits + system_bits]
+        work = cudaq.qvector(work_width)
+        o_loc(slot, system, work)
+        o_loc_adj(slot, system, work)
+
+    output = np.asarray(cudaq.get_state(roundtrip, state_from(ket)))
+    expected = np.zeros(1 << (data_width + work_width), dtype=np.complex128)
+    expected[:1 << data_width] = ket
+    np.testing.assert_allclose(output, expected, atol=1e-10)
+
+
+def test_dilated_value_oracle_on_both_halves():
+    encoding, _, matrix = _dilation_case()
+    oracles = encoding._oracles
+    assert encoding.num_system == 3
+    assert oracles.d == 3 and encoding.d_padded == 4
+
+    cases = [
+        (0, 1, matrix[1, 1], True),
+        (0, 5, matrix[1, 1], True),
+        (1, 0, matrix[1, 0], False),
+        (1, 4, matrix[1, 0], True),
+        (2, 3, matrix[2, 3], False),
+        (2, 7, matrix[2, 3], True),
+        (3, 2, 0.0, False),
+        (3, 6, 0.0, False),
+    ]
+    upper_bit = 1 << (oracles.value_bits + 1)
+    half_bit = 1 << (encoding.num_system - 1)
+    for slot, row, entry, valid in cases:
+        expected = (quantized_angle(entry, oracles.h, oracles.value_bits)
+                    if valid else 0)
+        if valid and entry < 0.0:
+            expected |= 1 << oracles.value_bits
+        if row & half_bit == 0:
+            expected |= upper_bit
+
+        slot_out, system_out, value_out, work_out = _oracle_probe(
+            oracles, encoding.num_system, slot, row, 2)
+        assert (slot_out, system_out, work_out) == (slot, row, 0), (slot, row)
+        assert value_out == expected, (slot, row)
 
 
 def test_dilation_controlled_walk_and_qsvt():

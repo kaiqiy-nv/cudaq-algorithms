@@ -20,11 +20,12 @@ import cudaq
 from cudaq_algorithms.fermion import (jordan_wigner, bravyi_kitaev_superfast,
                                       bravyi_kitaev_superfast_stabilizers)
 from cudaq_algorithms.fermion._compilers import _normalize_integrals
-from cudaq_algorithms.fermion._superfast import (_Graph, _b_word, _a_word,
-                                                 _anticommute, _build_graph,
-                                                 _encoding_backend, _word_mul,
-                                                 _error_correcting_local_modes,
-                                                 _stabilizer_subset)
+from cudaq_algorithms.fermion._superfast import (
+    _Graph, _b_word, _a_word, _anticommute, _build_graph,
+    _connected_components, _code_space_parity, _encoding_backend,
+    _loop_stabilizer_words, _word_mul, _error_correcting_local_modes,
+    _is_three_connected, _local_mode_provider, _pad_even_degree,
+    _stabilizer_subset, _validate_error_correcting_graph)
 
 _PAULI = {
     "I": np.eye(2),
@@ -435,6 +436,12 @@ def test_bounded_weight_beats_jordan_wigner():
 # ----------------------------------------------------------------------
 
 
+def test_connected_components_ignores_edges_to_inactive_modes():
+    active = {0, 1, 3}
+    edges = [(0, 1), (1, 2)]
+    assert _connected_components(active, edges) == {1, 3}
+
+
 def test_qubit_count_is_edge_count():
     n, edges = _GRAPHS["ring-4"]
     h, _ = _random_tight_binding(0, n, edges)
@@ -836,6 +843,56 @@ def test_error_correcting_degree6_modes_match_paper():
             for m in modes] == ["ZXI", "ZYI", "IZX", "IZY", "XIZ", "YIZ"]
 
 
+def test_error_correcting_local_mode_branches_and_validation():
+
+    def to_pauli_strings(modes, num_qubits):
+        strings = []
+        for mode in modes:
+            x_mask, z_mask = mode[1]
+            pauli_string = ""
+            for qubit in range(num_qubits):
+                bit = 1 << qubit
+                if x_mask & bit and z_mask & bit:
+                    pauli = "Y"
+                elif x_mask & bit:
+                    pauli = "X"
+                elif z_mask & bit:
+                    pauli = "Z"
+                else:
+                    pauli = "I"
+                pauli_string += pauli
+            strings.append(pauli_string)
+        return strings
+
+    degree8_modes = _local_mode_provider("error_correcting", 8)
+    assert to_pauli_strings(degree8_modes, 4) == [
+        "ZZXI", "ZZYI", "IZZX", "IZZY", "XIIZ", "YIIZ", "ZXII", "ZYII"
+    ]
+
+    degree10_modes = _local_mode_provider("error_correcting", 10)
+    assert to_pauli_strings(degree10_modes, 5) == [
+        "ZZXII", "ZZYII", "IZZXI", "IZZYI", "IIZZX", "IIZZY", "XIIZZ", "YIIZZ",
+        "ZXIIZ", "ZYIIZ"
+    ]
+
+    for degree, message in ((4, "even degree"), (7, "even degree"),
+                            (12, "qubit count other than 4")):
+        with pytest.raises(ValueError, match=message):
+            _error_correcting_local_modes(degree)
+
+    valid_modes = _error_correcting_local_modes(6)
+    invalid_coefficient_modes = list(valid_modes)
+    invalid_coefficient_modes[0] = (1.0j, invalid_coefficient_modes[0][1])
+    with pytest.raises(ValueError, match="Hermitian involutions"):
+        _local_mode_provider({6: invalid_coefficient_modes}, 6)
+
+    outside_support_modes = list(valid_modes)
+    coefficient, (x_mask, z_mask) = outside_support_modes[0]
+    outside_support_modes[0] = (coefficient, (x_mask | (1 << 3), z_mask))
+    with pytest.raises(ValueError, match="acts outside"):
+        _local_mode_provider({6: outside_support_modes}, 6)
+
+
 def _k7_error_correcting_backend():
     size = 7
     complete = [(i, j) for i in range(size) for j in range(i + 1, size)]
@@ -916,6 +973,26 @@ def test_three_connected_helper():
     # two triangles sharing a cut vertex (2) -> not even 2-connected
     assert not _is_three_connected(5, [(0, 1), (1, 2), (0, 2), (2, 3), (3, 4),
                                        (2, 4)])
+
+
+def test_error_correcting_padding_and_graph_validation_edges():
+    path = [(0, 1), (1, 2), (2, 3)]
+    padded = _pad_even_degree(4, path, min_degree=2)
+    assert padded == {(0, 1), (1, 2), (2, 3), (0, 3)}
+
+    triangle = [(0, 1), (1, 2), (0, 2)]
+    assert not _is_three_connected(3, triangle)
+
+    with pytest.raises(ValueError, match="even vertex degree"):
+        _validate_error_correcting_graph(
+            _Graph(4, [(0, 1), (1, 2), (2, 3), (0, 3)]))
+
+    k7 = [(i, j) for i in range(7) for j in range(i + 1, 7)]
+    disconnected_k7 = k7 + [(i + 7, j + 7) for i, j in k7]
+    with pytest.raises(ValueError, match="3-connected"):
+        _validate_error_correcting_graph(_Graph(14, disconnected_k7))
+
+    _validate_error_correcting_graph(_Graph(7, k7))
 
 
 # ----------------------------------------------------------------------
@@ -1137,6 +1214,38 @@ def test_stabilizer_subset_reproduces_target_on_wide_words(seed):
         px, pz = px ^ words[k][0], pz ^ words[k][1]
     assert (px, pz) == (tx, tz)
     assert _stabilizer_subset(words, (tx | (1 << 99), tz)) is None
+
+
+def test_superfast_internal_invariant_failures():
+    assert _stabilizer_subset([(0, 0), (1, 0), (1, 0)], (0, 0)) == []
+
+    class NonHermitianLoopBackend:
+        num_modes = 3
+        edges = [(0, 1), (0, 2), (1, 2)]
+
+        def a_word(self, i, j):
+            return 1.0, (0, 0)
+
+    with pytest.raises(RuntimeError, match="loop operator coefficient"):
+        _loop_stabilizer_words(NonHermitianLoopBackend())
+
+    class ParityBackend:
+        edges = [(0, 1)]
+
+        def __init__(self, stabilizers):
+            self._stabilizers = stabilizers
+
+        def _vertex_word(self, index):
+            return (1.0, (1, 0)) if index == 0 else (1.0, (0, 0))
+
+        def stabilizers(self):
+            return self._stabilizers
+
+    with pytest.raises(RuntimeError, match="not in the stabilizer group"):
+        _code_space_parity(ParityBackend([]))
+
+    with pytest.raises(RuntimeError, match="code space"):
+        _code_space_parity(ParityBackend([(1j, (1, 0))]))
 
 
 @pytest.mark.parametrize("parity", [0, 1])

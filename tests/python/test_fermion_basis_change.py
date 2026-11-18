@@ -148,6 +148,14 @@ def test_public_classical_kernels_match_fock_operator_and_control():
         np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
 
 
+@pytest.mark.parametrize("adjoint", [None, 0, 1, np.bool_(True), "true"])
+def test_controlled_kernel_rejects_non_boolean_adjoint(adjoint):
+    plan = _api()(np.eye(2))
+
+    with pytest.raises(ValueError, match="adjoint must be a boolean"):
+        plan.controlled_kernel(adjoint=adjoint)
+
+
 @pytest.mark.parametrize("reference_mode", [0, 1, 2])
 def test_numeric_basis_keeps_explicit_partial_structure(reference_mode):
     rng = np.random.default_rng(99)
@@ -251,6 +259,34 @@ def test_explicit_parameter_registers_and_direct_plan_default():
     direct = FermionBasisChange(plan.schedule, plan.angle_encoding)
     assert direct.parameter_registers == ((2, 3), (4, 5), (6, 7), (8, 9))
     assert direct.num_qubits == 10
+
+
+def test_direct_plan_constructor_validation_edges():
+    from collections.abc import Sequence
+
+    from cudaq_algorithms.basis_change import FermionBasisChange
+
+    schedule = _api()(np.eye(2)).schedule
+    with pytest.raises(ValueError, match="schedule"):
+        FermionBasisChange(object())
+    with pytest.raises(ValueError, match="angle_encoding"):
+        FermionBasisChange(schedule, object())
+
+    with pytest.raises(ValueError, match="each parameter word"):
+        FermionBasisChange(schedule, _encoding(2),
+                           ((2, ), (3, ), (4, ), (5, )))
+
+    class FailingSequence(Sequence):
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            raise TypeError
+
+    with pytest.raises(ValueError, match="ordered sequence"):
+        FermionBasisChange(schedule, _encoding(1),
+                           (FailingSequence(), (2, ), (3, ), (4, )))
 
 
 def _load_words(operation, qubits):

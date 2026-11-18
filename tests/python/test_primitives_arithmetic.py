@@ -117,6 +117,25 @@ def test_subtract_register_inverts_add_register(n):
                                    atol=1e-12)
 
 
+def test_subtract_register_and_constant_six_bit():
+    n = 6
+    bval = 17
+    register_state = np.array(
+        cudaq.get_state(_run_register_op_fixed_b, n, bval, 1))
+    np.testing.assert_allclose(register_state,
+                               _fixed_b_expected(n, bval, lambda a, b: b - a),
+                               atol=1e-12)
+
+    constant = 45
+    tval = 7
+    constant_state = np.array(
+        cudaq.get_state(_run_add_constant_basis, n, _bits(constant, n), tval,
+                        1, 0))
+    np.testing.assert_allclose(constant_state,
+                               _basis((tval - constant) % (1 << n), 2 * n + 1),
+                               atol=1e-12)
+
+
 # ----------------------------------------------------------------------
 # Constant add / subtract (CDKM and Draper QFT)
 # ----------------------------------------------------------------------
@@ -242,6 +261,15 @@ def _run_qft_then_iqft(n: int, xval: int):
     arith.iqft(reg)
 
 
+@cudaq.kernel
+def _run_iqft_from_fourier_state(n: int, xval: int):
+    reg = cudaq.qvector(n)
+    for k in range(n):
+        h(reg[k])
+        r1(6.283185307179586 * xval / (1 << (k + 1)), reg[k])
+    arith.iqft(reg)
+
+
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_qft_matches_analytic_no_swap(n):
     # On |x>, qubit t holds (|0> + exp(2 pi i x / 2^(t+1)) |1>)/sqrt(2), with no
@@ -280,6 +308,19 @@ def test_qft_add_constant_large_K_integer_reduction(n):
             np.testing.assert_allclose(added,
                                        _basis((tval + constant) % (1 << n), n),
                                        atol=1e-9)
+
+
+@pytest.mark.parametrize("subtract", [0, 1])
+@pytest.mark.parametrize("constant", [-(1 << 53) - 5, (1 << 53) + 5])
+@pytest.mark.parametrize("tval", [0, 5, 15])
+def test_qft_constant_large_signed_offsets(subtract, constant, tval):
+    n = 4
+    state = np.array(
+        cudaq.get_state(_run_add_constant_qft_basis, n, constant, tval,
+                        subtract, 0))
+    direction = -1 if subtract else 1
+    expected = _basis((tval + direction * constant) % (1 << n), n)
+    np.testing.assert_allclose(state, expected, atol=1e-9)
 
 
 # ----------------------------------------------------------------------
@@ -351,6 +392,25 @@ def test_cmp_ge_constant_all_inputs(n):
                                        atol=1e-12)
 
 
+@pytest.mark.parametrize("constant", [0, 1, 21, 32, 63, 64])
+@pytest.mark.parametrize("flag_init", (0, 1))
+def test_cmp_ge_constant_wide_complements(constant, flag_init):
+    n = 6
+    if constant == 0:
+        complement, k_is_zero = [0] * n, 1
+    else:
+        complement, k_is_zero = _bits((1 << n) - constant, n), 0
+
+    state = np.array(
+        cudaq.get_state(_run_cmp_ge_constant, n, complement, k_is_zero,
+                        flag_init))
+    np.testing.assert_allclose(state,
+                               _cmp_expected(n,
+                                             lambda value: value >= constant,
+                                             n + 1, flag_init),
+                               atol=1e-12)
+
+
 @pytest.mark.parametrize("n", WIDTHS)
 def test_cmp_ge_constant_qft_shift_all_inputs(n):
     # K over 0 .. 2^n inclusive (both boundaries), and out prepared to 0 and 1
@@ -380,6 +440,67 @@ def test_cmp_ge_constant_qft_shift_all_inputs(n):
                 for value in range(1 << n):
                     restored[value + (flag_init << n)] += norm
                 np.testing.assert_allclose(roundtrip, restored, atol=1e-10)
+
+
+@pytest.mark.parametrize("invert", (0, 1))
+@pytest.mark.parametrize("flag_init", (0, 1))
+def test_cmp_ge_constant_qft_shift_wider_register(invert, flag_init):
+    n = 6
+    constant = 37
+    norm = 1.0 / np.sqrt(1 << n)
+
+    shifted_state = np.array(
+        cudaq.get_state(_run_cmp_ge_constant_qft_shift, n, constant, invert, 0,
+                        flag_init))
+    expected_shifted = np.zeros(1 << (n + 1), dtype=np.complex128)
+    for value in range(1 << n):
+        predicate = value >= constant if invert == 0 else value < constant
+        shifted = (value - constant) % (1 << n)
+        flag = flag_init ^ int(predicate)
+        expected_shifted[shifted + (flag << n)] += norm
+    np.testing.assert_allclose(shifted_state, expected_shifted, atol=1e-10)
+
+    roundtrip = np.array(
+        cudaq.get_state(_run_cmp_ge_constant_qft_shift, n, constant, invert, 1,
+                        flag_init))
+    expected_restored = np.zeros(1 << (n + 1), dtype=np.complex128)
+    for value in range(1 << n):
+        expected_restored[value + (flag_init << n)] += norm
+    np.testing.assert_allclose(roundtrip, expected_restored, atol=1e-10)
+
+
+def test_iqft_and_qft_shift_boundary_cases():
+    n = 6
+    xval = 37
+    state = np.array(cudaq.get_state(_run_iqft_from_fourier_state, n, xval))
+    np.testing.assert_allclose(state, _basis(xval, n), atol=1e-10)
+
+    norm = 1.0 / np.sqrt(1 << n)
+    for constant in (0, 63):
+        for invert in (0, 1):
+            for flag_init in (0, 1):
+                shifted_state = np.array(
+                    cudaq.get_state(_run_cmp_ge_constant_qft_shift, n,
+                                    constant, invert, 0, flag_init))
+                expected_shifted = np.zeros(1 << (n + 1), dtype=np.complex128)
+                for value in range(1 << n):
+                    predicate = (value >= constant
+                                 if invert == 0 else value < constant)
+                    shifted = (value - constant) % (1 << n)
+                    flag = flag_init ^ int(predicate)
+                    expected_shifted[shifted + (flag << n)] += norm
+                np.testing.assert_allclose(shifted_state,
+                                           expected_shifted,
+                                           atol=1e-10)
+
+                roundtrip = np.array(
+                    cudaq.get_state(_run_cmp_ge_constant_qft_shift, n,
+                                    constant, invert, 1, flag_init))
+                np.testing.assert_allclose(roundtrip,
+                                           _cmp_expected(
+                                               n, lambda value: False, 0,
+                                               flag_init),
+                                           atol=1e-10)
 
 
 # ----------------------------------------------------------------------
@@ -472,6 +593,18 @@ def test_cmp_register_truth_table_exhaustive(n, name, strict, predicate):
                                            atol=1e-12)
 
 
+@pytest.mark.parametrize("n", [1, 6], ids=["single_bit", "six_bit"])
+def test_cmp_gt_register_boundary_widths(n):
+    state = np.array(cudaq.get_state(_run_cmp_register_superposed, n, 1))
+    expected = np.zeros(1 << (2 * n + 2), dtype=np.complex128)
+    norm = 1.0 / (1 << n)
+    for aval in range(1 << n):
+        for bval in range(1 << n):
+            index = aval + (bval << n) + (int(aval > bval) << (2 * n + 1))
+            expected[index] += norm
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
 @pytest.mark.parametrize("n", WIDTHS)
 @pytest.mark.parametrize("name,strict,predicate", _CMP_REGISTER_OPS)
 def test_cmp_register_all_inputs_superposed(n, name, strict, predicate):
@@ -482,6 +615,18 @@ def test_cmp_register_all_inputs_superposed(n, name, strict, predicate):
         for bval in range(1 << n):
             index = aval + (bval << n) + (int(predicate(aval, bval)) <<
                                           (2 * n + 1))
+            expected[index] += norm
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_cmp_ge_register_six_bit_superposition():
+    n = 6
+    state = np.array(cudaq.get_state(_run_cmp_register_superposed, n, 0))
+    expected = np.zeros(1 << (2 * n + 2), dtype=np.complex128)
+    norm = 1.0 / (1 << n)
+    for aval in range(1 << n):
+        for bval in range(1 << n):
+            index = aval + (bval << n) + (int(aval >= bval) << (2 * n + 1))
             expected[index] += norm
     np.testing.assert_allclose(state, expected, atol=1e-12)
 
@@ -525,6 +670,28 @@ def test_add_register_basis_spot_checks():
         state = np.array(cudaq.get_state(_spot_add, n, aval, bval))
         index = aval + (((aval + bval) % (1 << n)) << n)
         np.testing.assert_allclose(state, _basis(index, 2 * n + 1), atol=1e-12)
+
+
+def test_six_bit_cdkm_add_register_and_constant():
+    n = 6
+    bval = 45
+    register_state = np.array(
+        cudaq.get_state(_run_register_op_fixed_b, n, bval, 0))
+    np.testing.assert_allclose(register_state,
+                               _fixed_b_expected(
+                                   n, bval,
+                                   lambda addend, target: addend + target),
+                               atol=1e-12)
+
+    constant = 45
+    target_value = 23
+    constant_state = np.array(
+        cudaq.get_state(_run_add_constant_basis, n, _bits(constant, n),
+                        target_value, 0, 0))
+    np.testing.assert_allclose(constant_state,
+                               _basis((target_value + constant) % (1 << n),
+                                      2 * n + 1),
+                               atol=1e-12)
 
 
 # ----------------------------------------------------------------------

@@ -111,6 +111,13 @@ def test_hartree_fock_canonical_statevector():
     _assert_basis_state(state, 0b0111)
 
 
+@pytest.mark.parametrize("num_electrons,expected_index", [(0, 0), (1, 1)])
+def test_hartree_fock_zero_and_positive_electrons_statevector(
+        num_electrons, expected_index):
+    state = _state(_hartree_fock_entry, 4, num_electrons)
+    _assert_basis_state(state, expected_index)
+
+
 def test_hartree_fock_explicit_occupation_statevector():
     state = _state(_occupation_entry, 4, [0, 2])
     _assert_basis_state(state, 0b0101)
@@ -271,6 +278,25 @@ def test_fixed_parameter_ucc_matches_dense_pool_exponential(
     _assert_close(actual, reference)
 
 
+def test_fixed_parameter_ucc_custom_group_sizes_match_dense_exponential():
+    from cudaq import spin
+
+    pool = [
+        0.4 * spin.x(0) * spin.z(1) + 0.2 * spin.y(0) * spin.x(1),
+        -0.35 * spin.z(0) * spin.z(1),
+    ]
+    words, coeffs = stateprep.get_fixed_parameter_ucc_pauli_lists(pool, 2)
+    assert [len(group) for group in words] == [2, 1]
+
+    parameters = [0.27, -0.19]
+    actual = _state(_hf_ucc_entry, 2, 1, parameters, words, coeffs)
+
+    hf_ket = np.zeros(1 << 2, dtype=np.complex128)
+    hf_ket[1] = 1.0
+    reference = _dense_pool_evolution(pool, parameters, 2, hf_ket)
+    _assert_close(actual, reference)
+
+
 # ----------------------------------------------------------------------------
 # hartree_fock_ucc_kernel factory
 # ----------------------------------------------------------------------------
@@ -299,6 +325,58 @@ def test_factory_matches_grouped_argument_kernel():
                                                 coeffs,
                                                 num_electrons=2)
     np.testing.assert_allclose(_prepared_state(4, factory), manual, atol=1e-12)
+
+
+def test_factory_combined_and_ucc_only_match_dense_word_product():
+    from scipy.linalg import expm
+
+    num_qubits = 2
+    parameters = [0.31]
+    words = [["XI", "ZY"]]
+    coefficients = [[0.7, -0.4]]
+
+    for occupied in ([0], []):
+        factory = stateprep.hartree_fock_ucc_kernel(num_qubits,
+                                                    parameters,
+                                                    words,
+                                                    coefficients,
+                                                    occupied_orbitals=occupied)
+        actual = _prepared_state(num_qubits, factory)
+
+        reference = np.zeros(1 << num_qubits, dtype=np.complex128)
+        reference[sum(1 << index for index in occupied)] = 1.0
+        for word, coefficient in zip(words[0], coefficients[0]):
+            generator = dense_matrix([(1.0, word)], num_qubits)
+            angle = parameters[0] * coefficient
+            reference = expm(1.0j * angle * generator) @ reference
+
+        _assert_close(actual, reference)
+
+
+def test_factory_zero_electron_count_uses_ucc_only_dense_reference():
+    from scipy.linalg import expm
+
+    num_qubits = 2
+    parameters = [0.31, -0.23]
+    words = [["XI"], ["ZY"]]
+    coefficients = [[0.7], [-0.4]]
+    factory = stateprep.hartree_fock_ucc_kernel(num_qubits,
+                                                parameters,
+                                                words,
+                                                coefficients,
+                                                num_electrons=0)
+    actual = _prepared_state(num_qubits, factory)
+
+    reference = np.zeros(1 << num_qubits, dtype=np.complex128)
+    reference[0] = 1.0
+    for theta, word_group, coefficient_group in zip(parameters, words,
+                                                    coefficients):
+        for word, coefficient in zip(word_group, coefficient_group):
+            generator = dense_matrix([(1.0, word)], num_qubits)
+            reference = expm(
+                1.0j * theta * coefficient * generator) @ reference
+
+    _assert_close(actual, reference)
 
 
 def test_factory_open_shell_reference():
@@ -337,6 +415,29 @@ def test_factory_string_words_and_hf_only_shapes():
     identity = stateprep.hartree_fock_ucc_kernel(2, [], [], [],
                                                  num_electrons=0)
     _assert_basis_state(_prepared_state(2, identity), 0b00)
+
+
+def test_factory_identity_prep_preserves_superposition():
+    identity = stateprep.hartree_fock_ucc_kernel(2, [], [], [],
+                                                 num_electrons=0)
+
+    @cudaq.kernel
+    def entry():
+        q = cudaq.qvector(2)
+        x(q[1])
+        h(q[0])
+        identity(q)
+
+    expected = np.zeros(4, dtype=np.complex128)
+    expected[2:4] = 1.0 / np.sqrt(2.0)
+    _assert_close(_state(entry), expected)
+
+
+def test_factory_explicit_occupation_hf_only_statevector():
+    occupied_orbitals = [0, 2, 3]
+    hf_only = stateprep.hartree_fock_ucc_kernel(
+        4, [], [], [], occupied_orbitals=occupied_orbitals)
+    _assert_basis_state(_prepared_state(4, hf_only), 0b1101)
 
 
 def test_factory_validates_inputs():

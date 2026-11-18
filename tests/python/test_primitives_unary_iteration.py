@@ -24,7 +24,8 @@ from cudaq_algorithms.primitives import unary_iteration_kernels
 from cudaq_algorithms.primitives._unary_iteration import (
     _OP_BODY_X, _OP_CCX, _OP_CCX_ADDR_ADDR, _OP_CCX_CTRL, _OP_CX_ADDR_ADDR,
     _OP_CX_ADDR_LADDER, _OP_CX_CTRL_LADDER, _OP_CX_LADDER_LADDER, _OP_X_ADDR,
-    _OP_X_LADDER, _TOFFOLI_OPCODES, _emit_walk, _walk_toffoli_count)
+    _OP_X_LADDER, _TOFFOLI_OPCODES, _emit_walk, _mint_interpreter,
+    _walk_toffoli_count)
 
 
 def _basis(index: int, num_qubits: int) -> np.ndarray:
@@ -162,6 +163,38 @@ def test_unary_iteration_phase_kick_per_address(num_items, marked):
     np.testing.assert_allclose(state, expected, atol=1e-12)
 
 
+def test_unary_iteration_work_interpreter_executes_address_ccx():
+    marked_address = 3
+    walk = unary_iteration_kernels(
+        3, 8, lambda address: [("x_w", 0, 0)]
+        if address == marked_address else [])
+
+    assert not walk.controlled
+    assert walk.num_work == 1
+    assert any(op[0] == _OP_CCX_ADDR_ADDR for op in walk.ops)
+    kernel = walk.kernel
+
+    @cudaq.kernel
+    def run():
+        address_reg = cudaq.qvector(3)
+        ladder = cudaq.qvector(3)
+        target = cudaq.qvector(1)
+        work = cudaq.qvector(1)
+        x(work[0])
+        for address_bit in range(3):
+            h(address_reg[address_bit])
+        kernel(address_reg, ladder, target, work)
+
+    state = np.array(cudaq.get_state(run))
+    expected = np.zeros(1 << 8, dtype=np.complex128)
+    amplitude = 1.0 / np.sqrt(8.0)
+    for address in range(8):
+        target_bit = int(address == marked_address)
+        expected[address + (target_bit << 6) + (1 << 7)] = amplitude
+
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
 def test_unary_iteration_y_body_sign_convention():
     # body(2) = Y on target 0: |2>|0> -> i |2>|1>; other addresses idle.
     walk = unary_iteration_kernels(2, 4, lambda k: [("y", 0)]
@@ -242,6 +275,29 @@ def test_unary_iteration_matches_dense_select_reference():
             for t in range(4):
                 expected[address + (t << 6)] = reference[t]
             np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
+def test_empty_plain_interpreter_tape_is_identity():
+    interpreter = _mint_interpreter([], controlled=False, has_work=False)
+
+    @cudaq.kernel
+    def run():
+        address = cudaq.qvector(1)
+        ladder = cudaq.qvector(1)
+        target = cudaq.qvector(1)
+        h(address[0])
+        ry(0.6, ladder[0])
+        ry(0.8, target[0])
+        s(target[0])
+        interpreter(address, ladder, target)
+
+    state = np.array(cudaq.get_state(run))
+    address_state = np.array([1.0, 1.0], dtype=np.complex128) / np.sqrt(2.0)
+    ladder_state = np.array([np.cos(0.3), np.sin(0.3)], dtype=np.complex128)
+    target_state = np.array([np.cos(0.4), 1.0j * np.sin(0.4)],
+                            dtype=np.complex128)
+    expected = np.kron(target_state, np.kron(ladder_state, address_state))
+    np.testing.assert_allclose(state, expected, atol=1e-12)
 
 
 def test_unary_iteration_adjoint_composes_to_identity():
@@ -339,6 +395,35 @@ def test_unary_iteration_validation_raises():
         unary_iteration_kernels(2, 4, lambda k: [("q", 0)])
     with pytest.raises(ValueError, match="invalid target qubit index"):
         unary_iteration_kernels(2, 4, lambda k: [("x", -1)])
+
+
+@pytest.mark.parametrize(
+    "body_item,num_work,error",
+    [
+        pytest.param(
+            ("x", ), None, r"0 operands \(expected 1\)", id="base-arity"),
+        pytest.param(("and_tt", 0, 1),
+                     None,
+                     r"2 operands \(expected 3\)",
+                     id="extended-arity"),
+        pytest.param(("x", 0.5),
+                     None,
+                     "invalid target qubit index",
+                     id="fractional-target"),
+        pytest.param(("and_tt", 0, 1, -1),
+                     None,
+                     "invalid work qubit index",
+                     id="negative-work"),
+        pytest.param(("and_tt", 0, 1, 2),
+                     2,
+                     r"num_work must be an integer >= the body's work usage",
+                     id="insufficient-work-width"),
+    ],
+)
+def test_unary_iteration_rejects_malformed_bodies_and_insufficient_work(
+        body_item, num_work, error):
+    with pytest.raises(ValueError, match=error):
+        unary_iteration_kernels(1, 1, lambda k: [body_item], num_work=num_work)
 
 
 def test_describe_decodes_the_tape():

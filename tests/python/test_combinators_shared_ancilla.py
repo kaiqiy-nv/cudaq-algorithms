@@ -9,7 +9,7 @@ import cudaq
 
 from cudaq_algorithms import PauliLCU, PhaseSequence, QSVT, SumEncoding, Walk, state_from
 from dense_references import random_ket
-from test_combinators import _block, _chebyshev
+from test_combinators import _block, _chebyshev, _sum_case
 from test_qsvt import reference_response
 
 
@@ -124,6 +124,47 @@ def test_sum_padded_slot_is_identity_for_arbitrary_flag_and_pool():
     np.testing.assert_allclose(out, joint, atol=1e-12)
 
 
+def test_sum_unprepare_kernel_inverts_three_bit_slot_preparation_on_entangled_state(
+):
+    encoding, _, terms = _sum_case("five-repeated")
+    prepare = encoding.prepare_kernel()
+    unprepare = encoding.unprepare_kernel()
+    n = encoding.num_system
+    num_slots = encoding.num_slots
+    joint = random_ket(n + encoding.num_ancilla, seed=37)
+    indices = np.arange(joint.size)
+    slot_indices = (indices >> n) & ((1 << num_slots) - 1)
+    joint[slot_indices != 0] = 0.0
+    joint /= np.linalg.norm(joint)
+
+    @cudaq.kernel
+    def prepare_slot(state: cudaq.State):
+        qubits = cudaq.qvector(state)
+        prepare(qubits[n:])
+
+    prepared = np.asarray(cudaq.get_state(prepare_slot, state_from(joint)))
+    slot_probabilities = np.bincount(slot_indices,
+                                     weights=np.abs(prepared)**2,
+                                     minlength=1 << num_slots)
+    expected_probabilities = np.zeros(1 << num_slots)
+    for slot, (coefficient, operand) in enumerate(terms):
+        physical_slot = int(f"{slot:0{num_slots}b}"[::-1], 2)
+        expected_probabilities[physical_slot] = (abs(coefficient) *
+                                                 operand.alpha /
+                                                 encoding.alpha)
+    np.testing.assert_allclose(slot_probabilities,
+                               expected_probabilities,
+                               atol=1e-12)
+
+    @cudaq.kernel
+    def unprepare_slot(state: cudaq.State):
+        qubits = cudaq.qvector(state)
+        unprepare(qubits[n:])
+
+    output = np.asarray(cudaq.get_state(unprepare_slot, state_from(prepared)))
+    np.testing.assert_allclose(output, joint, atol=1e-12)
+
+
 def test_sum_controlled_walk_roundtrip_on_entangled_control_and_ancillas():
     encoding = _noncommuting_sum(-1.0)
     step = encoding.controlled_walk_step_kernel()
@@ -149,6 +190,42 @@ def _nested_sum(coefficient):
     scaled = np.array([[0.6, 0.7 + coefficient], [0.7 + coefficient, 1.4]
                        ]) / 2.7
     return encoding, scaled
+
+
+def test_nested_sum_coherent_control_is_exact_controlled_unitary():
+    encoding, scaled = _nested_sum(0.6)
+    controlled = encoding.controlled_apply_kernel()
+    n = encoding.num_system
+    dim_s, dim_a = 1 << n, 1 << encoding.num_ancilla
+    joint = random_ket(n + 1 + encoding.num_ancilla, seed=35)
+    expected = joint.reshape(dim_a, 2, dim_s).copy()
+    on = expected[:, 1, :].reshape(-1)
+    on_norm = np.linalg.norm(on)
+    on_out = np.asarray(
+        cudaq.get_state(_apply_to_joint_state(encoding),
+                        state_from(on / on_norm)))
+    expected[:, 1, :] = (on_norm * on_out).reshape(dim_a, dim_s)
+
+    @cudaq.kernel
+    def circuit(state: cudaq.State):
+        qubits = cudaq.qvector(state)
+        controlled(qubits[n:], qubits[:n])
+
+    out = np.asarray(cudaq.get_state(circuit, state_from(joint)))
+    np.testing.assert_allclose(out, expected.reshape(-1), atol=1e-12)
+
+    ket = random_ket(n, seed=36)
+    apply = encoding.apply_kernel()
+    num_ancilla = encoding.num_ancilla
+
+    @cudaq.kernel
+    def apply_from_system(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(num_ancilla)
+        apply(ancilla, system)
+
+    block = _block(encoding, apply_from_system, ket)
+    np.testing.assert_allclose(block, scaled @ ket, atol=1e-12)
 
 
 @pytest.mark.parametrize("coefficient", [0.6, -0.6])

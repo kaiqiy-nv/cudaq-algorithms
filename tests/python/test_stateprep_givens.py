@@ -57,6 +57,24 @@ def _complex_entry(num_spin_orbitals: int, orbital_indices: list[int],
                                                     num_electrons)
 
 
+@cudaq.kernel
+def _givens_rotation_entry(num_spin_orbitals: int, theta: float,
+                           first_orbital: int, second_orbital: int):
+    q = cudaq.qvector(num_spin_orbitals)
+    x(q[0])
+    stateprep.givens_rotation(q, theta, first_orbital, second_orbital)
+
+
+@cudaq.kernel
+def _phase_givens_rotation_entry(num_spin_orbitals: int, theta: float,
+                                 phase: float, first_orbital: int,
+                                 second_orbital: int):
+    q = cudaq.qvector(num_spin_orbitals)
+    x(q[0])
+    stateprep.phase_givens_rotation(q, theta, phase, first_orbital,
+                                    second_orbital)
+
+
 # ----------------------------------------------------------------------------
 # References and helpers
 # ----------------------------------------------------------------------------
@@ -143,6 +161,48 @@ def _prepare_complex_slater_state(orbital_coefficients):
                         stateprep.get_givens_rotation_angles(schedule),
                         stateprep.get_givens_rotation_phases(schedule),
                         list(schedule.final_phases), num_electrons))
+
+
+def test_direct_givens_orientations_and_flattened_guard_paths():
+    theta = 0.37
+    phase = 0.61
+    reverse = np.asarray(
+        cudaq.get_state(_givens_rotation_entry, 3, theta, 1, 0))
+    reverse_reference = np.asarray(
+        cudaq.get_state(_givens_rotation_entry, 3, -theta, 0, 1))
+    np.testing.assert_allclose(reverse, reverse_reference, atol=1.0e-12)
+
+    nonadjacent = np.asarray(
+        cudaq.get_state(_givens_rotation_entry, 3, theta, 0, 2))
+    expected_initial = np.zeros(8, dtype=complex)
+    expected_initial[1] = 1.0
+    np.testing.assert_allclose(nonadjacent, expected_initial, atol=1.0e-12)
+
+    phase_state = np.asarray(
+        cudaq.get_state(_phase_givens_rotation_entry, 3, theta, phase, 1, 0))
+    phase_factors = np.asarray([
+        np.exp(0.5j * phase if basis_index & 1 else -0.5j * phase)
+        for basis_index in range(8)
+    ])
+    np.testing.assert_allclose(phase_state,
+                               reverse * phase_factors,
+                               atol=1.0e-12)
+
+    real_state = np.asarray(cudaq.get_state(_real_entry, 3, [1, 0], [theta],
+                                            1))
+    np.testing.assert_allclose(real_state, reverse, atol=1.0e-12)
+    real_mismatch = np.asarray(cudaq.get_state(_real_entry, 3, [0], [theta],
+                                               1))
+    expected_vacuum = np.zeros(8, dtype=complex)
+    expected_vacuum[0] = 1.0
+    np.testing.assert_allclose(real_mismatch, expected_vacuum, atol=1.0e-12)
+
+    complex_state = np.asarray(
+        cudaq.get_state(_complex_entry, 3, [1, 0], [theta], [phase], [0.0], 1))
+    np.testing.assert_allclose(complex_state, phase_state, atol=1.0e-12)
+    complex_mismatch = np.asarray(
+        cudaq.get_state(_complex_entry, 3, [0], [theta], [phase], [0.0], 1))
+    np.testing.assert_allclose(complex_mismatch, expected_vacuum, atol=1.0e-12)
 
 
 # ----------------------------------------------------------------------------
@@ -580,6 +640,19 @@ def test_factory_matches_real_kernel_path():
                                atol=1.0e-12)
 
 
+def test_factory_matches_real_three_electron_kernel_path():
+    rng = np.random.default_rng(61)
+    orbital_coefficients, _ = np.linalg.qr(rng.normal(size=(5, 3)))
+    schedule = stateprep.make_givens_rotation_schedule(orbital_coefficients)
+    assert not schedule.is_complex
+    assert schedule.rotations
+
+    prep = stateprep.slater_determinant_kernel(schedule)
+    actual = _prepared_state(schedule.num_spin_orbitals, prep)
+    expected = _reference_slater_state(orbital_coefficients)
+    _assert_allclose_up_to_global_phase(actual, expected)
+
+
 def test_factory_matches_complex_kernel_path():
     rng = np.random.default_rng(59)
     raw = rng.normal(size=(5, 3)) + 1j * rng.normal(size=(5, 3))
@@ -593,6 +666,22 @@ def test_factory_matches_complex_kernel_path():
                                                prep),
                                direct,
                                atol=1.0e-12)
+
+
+def test_factory_complex_one_electron_matches_dense_minor_reference():
+    theta = 0.41
+    phase = 0.73
+    orbital_coefficients = np.array([[np.cos(theta)],
+                                     [np.exp(1j * phase) * np.sin(theta)]])
+    schedule = stateprep.make_givens_rotation_schedule(orbital_coefficients)
+
+    assert schedule.is_complex
+    assert len(schedule.rotations) == 1
+
+    prep = stateprep.slater_determinant_kernel(schedule)
+    actual = _prepared_state(2, prep)
+    expected = _reference_slater_state(orbital_coefficients)
+    _assert_allclose_up_to_global_phase(actual, expected)
 
 
 def test_factory_rotation_free_shapes():
@@ -618,6 +707,41 @@ def test_factory_rotation_free_shapes():
     complex_prep = stateprep.slater_determinant_kernel(complex_schedule)
     np.testing.assert_allclose(_prepared_state(4, complex_prep),
                                _prepare_complex_slater_state(matrix),
+                               atol=1.0e-12)
+
+
+def test_factory_rotation_free_real_three_electron_statevector():
+    matrix = np.zeros((5, 3), dtype=float)
+    matrix[:3, :] = np.eye(3)
+
+    schedule = stateprep.make_givens_rotation_schedule(matrix)
+    assert not schedule.is_complex
+    assert schedule.rotations == []
+
+    prep = stateprep.slater_determinant_kernel(schedule)
+    expected = np.zeros(1 << 5, dtype=complex)
+    expected[0b00111] = 1.0
+    np.testing.assert_allclose(_prepared_state(5, prep),
+                               expected,
+                               atol=1.0e-12)
+
+
+def test_factory_rotation_free_complex_three_electron_statevector():
+    phases = np.array([0.23, -0.47, 0.81])
+    matrix = np.zeros((5, 3), dtype=complex)
+    for orbital, phase in enumerate(phases):
+        matrix[orbital, orbital] = np.exp(1j * phase)
+
+    schedule = stateprep.make_givens_rotation_schedule(matrix)
+    assert schedule.is_complex
+    assert schedule.rotations == []
+    np.testing.assert_allclose(schedule.final_phases, phases, atol=1.0e-12)
+
+    prep = stateprep.slater_determinant_kernel(schedule)
+    expected = np.zeros(1 << 5, dtype=complex)
+    expected[0b00111] = np.exp(0.5j * np.sum(phases))
+    np.testing.assert_allclose(_prepared_state(5, prep),
+                               expected,
                                atol=1.0e-12)
 
 
@@ -715,6 +839,12 @@ def test_orbital_rotation_schedule_edge_cases_and_validation():
     modes, angles = stateprep.orbital_rotation_program(identity, inverse=False)
     # No rotations: the program is the single zero-angle (identity) rotation.
     assert modes == [0] and angles == [0.0]
+
+
+def test_orbital_rotation_schedule_post_sweep_guard_for_negative_tolerance():
+    with pytest.raises(ValueError, match="Givens sweep did not reduce"):
+        stateprep.make_orbital_rotation_schedule([[0.0, 1.0], [1.0, 0.0]],
+                                                 tolerance=-1.0e-6)
 
 
 @pytest.mark.parametrize("matrix", [
@@ -817,6 +947,45 @@ def test_single_mode_padding_supports_control_and_adjoint(adjoint):
     ket /= np.linalg.norm(ket)
     actual = np.asarray(cudaq.get_state(apply, algorithms.state_from(ket)))
     np.testing.assert_allclose(actual, ket, atol=_reference_atol())
+
+
+@pytest.mark.controlled_composition
+def test_spatial_givens_nonzero_controlled_network_adjoint_segment():
+    theta = 0.37
+    modes, angles = [0], [theta]
+
+    @cudaq.kernel
+    def controlled_network(state: cudaq.State):
+        q = cudaq.qvector(state)
+        cudaq.control(stateprep.spatial_givens_network, q[4], q[0:4], modes,
+                      angles)
+
+    initial = np.zeros(32, dtype=complex)
+    initial[1] = 1.0 / np.sqrt(2.0)
+    initial[17] = 1.0 / np.sqrt(2.0)
+    expected = np.zeros(32, dtype=complex)
+    expected[1] = 1.0 / np.sqrt(2.0)
+    expected[17] = np.cos(theta) / np.sqrt(2.0)
+    expected[20] = -np.sin(theta) / np.sqrt(2.0)
+    controlled_state = np.asarray(
+        cudaq.get_state(controlled_network, algorithms.state_from(initial)))
+    np.testing.assert_allclose(controlled_state, expected, atol=1.0e-12)
+
+    @cudaq.kernel
+    def adjoint_segment(state: cudaq.State):
+        system = cudaq.qvector(state)
+        cudaq.adjoint(stateprep.spatial_givens_segment, system, modes, angles,
+                      0, 1)
+
+    segment_initial = np.zeros(16, dtype=complex)
+    segment_initial[1] = 1.0
+    segment_expected = np.zeros(16, dtype=complex)
+    segment_expected[1] = np.cos(theta)
+    segment_expected[4] = np.sin(theta)
+    segment_state = np.asarray(
+        cudaq.get_state(adjoint_segment,
+                        algorithms.state_from(segment_initial)))
+    np.testing.assert_allclose(segment_state, segment_expected, atol=1.0e-12)
 
 
 def _jw_creation(qubit, num_qubits):

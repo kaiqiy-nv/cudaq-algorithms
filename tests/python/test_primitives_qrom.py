@@ -19,6 +19,7 @@ import pytest
 import cudaq
 
 from cudaq_algorithms.primitives import QROM
+from cudaq_algorithms.primitives._qrom import _mint_route
 
 
 def _basis(index: int, num_qubits: int) -> np.ndarray:
@@ -31,6 +32,27 @@ def _basis(index: int, num_qubits: int) -> np.ndarray:
 # [A, A + L), output at [A + L, A + L + W) — so the expected state on
 # reading address k is the basis vector k + (data[k] << (A + L)), the
 # ladder having returned to 0.
+
+
+def test_qrom_route_empty_and_single_swap():
+    empty_swaps = np.array([], dtype=np.int64)
+    empty_route = _mint_route(empty_swaps, empty_swaps, empty_swaps)
+    route = _mint_route([0], [0], [1])
+
+    @cudaq.kernel
+    def run():
+        low = cudaq.qvector(1)
+        blocks = cudaq.qvector(2)
+        h(low[0])
+        x(blocks[0])
+        empty_route(low, blocks)
+        route(low, blocks)
+
+    state = np.array(cudaq.get_state(run))
+    expected = np.zeros(8, dtype=np.complex128)
+    expected[2] = 1.0 / np.sqrt(2.0)
+    expected[5] = 1.0 / np.sqrt(2.0)
+    np.testing.assert_allclose(state, expected, atol=1e-12)
 
 
 def _qrom_readout_state(qrom: QROM, address: int) -> np.ndarray:
@@ -497,6 +519,25 @@ def test_controlled_qrom_control_conventions(data, address_bits, output_bits,
     np.testing.assert_allclose(at_plus[:, 1], after / np.sqrt(2), atol=1e-12)
 
 
+def test_controlled_select_swap_wide_output_copy_loop():
+    data = [0b10101, 0b00110, 0b11100]
+    address_bits, output_bits, preload = 2, 5, 0b01011
+    _, ctrl = _controlled_fixture(data, address_bits, output_bits,
+                                  "select_swap", 2)
+    assert ctrl.controlled is True
+    assert ctrl.variant == "select_swap"
+    assert ctrl.block_size == 2
+    assert ctrl.num_output == 5
+
+    state = _controlled_lookup_state(ctrl, preload, control_mode=2)
+    before = _superposed_input_state(address_bits, ctrl.num_ladder,
+                                     output_bits, preload)
+    expected = _expected_lookup_state(data, address_bits, ctrl.num_ladder,
+                                      output_bits, preload)
+    np.testing.assert_allclose(state[:, 0], before / np.sqrt(2), atol=1e-12)
+    np.testing.assert_allclose(state[:, 1], expected / np.sqrt(2), atol=1e-12)
+
+
 @pytest.mark.parametrize(
     "data,address_bits,output_bits,variant,block_size,preload",
     _CTRL_GEOMETRIES)
@@ -567,3 +608,19 @@ def test_controlled_qrom_auto_prices_controlled_candidates():
     assert ctrl.toffoli_count == min(
         _walk_toffoli_count(3, 7, True),
         min(_select_swap_cost(3, 7, 1, size, True) for size in (2, 4)))
+
+
+def test_qrom_select_swap_multibit_superposed_lookup():
+    data = [0b01, 0b10, 0b11, 0b00, 0b10, 0b01, 0b11, 0b10, 0b00, 0b11, 0b01]
+    qrom = QROM(data,
+                address_bits=4,
+                output_bits=2,
+                variant="select_swap",
+                block_size=4)
+    preload = 0b10
+    assert qrom.variant == "select_swap"
+    assert qrom.block_size == 4
+
+    actual = _plain_lookup_state(qrom, preload)
+    expected = _expected_lookup_state(data, 4, qrom.num_ladder, 2, preload)
+    np.testing.assert_allclose(actual, expected, atol=1e-12)

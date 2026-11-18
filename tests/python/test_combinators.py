@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import cudaq
+from cudaq_algorithms.combinators import _pair
 
 from cudaq_algorithms import sim_utils as sim
 from cudaq_algorithms import (BlockEncoding, PauliLCU, PhaseSequence, QSVT,
@@ -103,6 +104,8 @@ SUM_CASES = {
     "three-mixed-widths": [(0.3, TERMS_A), (-1.2, TERMS_B), (0.5, TERMS_C)],
     "five-repeated": [(1.0, TERMS_A), (-1.0, TERMS_B), (2.0, TERMS_C),
                       (-0.5, TERMS_A), (0.25, TERMS_B)],
+    "four-slot-negative-all-ones": [(0.5, TERMS_A), (0.8, TERMS_B),
+                                    (0.4, TERMS_C), (-0.6, TERMS_A)],
 }
 
 
@@ -146,6 +149,29 @@ def test_sum_block_is_weighted_sum_over_alpha(name):
                                atol=1e-12)
 
 
+def test_sum_prepare_kernel_matches_slot_probabilities():
+    encoding, _, terms = _sum_case("five-repeated")
+    assert encoding.num_slots == 3
+    prepare = encoding.prepare_kernel()
+    num_ancilla = encoding.num_ancilla
+    probabilities = np.array([
+        abs(coefficient) * summand.alpha / encoding.alpha
+        for coefficient, summand in terms
+    ])
+
+    @cudaq.kernel
+    def prepared_slots():
+        ancilla = cudaq.qvector(num_ancilla)
+        prepare(ancilla)
+
+    state = np.asarray(cudaq.get_state(prepared_slots), dtype=np.complex128)
+    expected = np.zeros(1 << num_ancilla, dtype=np.complex128)
+    for slot_index, probability in enumerate(probabilities):
+        basis_index = int(f"{slot_index:0{encoding.num_slots}b}"[::-1], 2)
+        expected[basis_index] = np.sqrt(probability)
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
 def test_sum_of_pauli_lcus_matches_the_merged_pauli_lcu():
     """The degenerate case pins the normalization arithmetic exactly."""
     a, b = _encoding(TERMS_A), _encoding(TERMS_B)
@@ -181,6 +207,23 @@ def test_sum_encode_kernel_with_injected_state_prep():
     np.testing.assert_allclose(block, dense @ ket / encoding.alpha, atol=1e-12)
 
 
+def test_sum_apply_is_involution_on_arbitrary_ancillas():
+    encoding, _, _ = _sum_case("three-mixed-widths")
+    n_sys = encoding.num_system
+    n_total = n_sys + encoding.num_ancilla
+    apply = encoding.apply_kernel()
+    ket = random_ket(n_total, 32)
+
+    @cudaq.kernel
+    def apply_twice(state: cudaq.State):
+        reg = cudaq.qvector(state)
+        apply(reg[n_sys:n_total], reg[0:n_sys])
+        apply(reg[n_sys:n_total], reg[0:n_sys])
+
+    output = np.asarray(cudaq.get_state(apply_twice, state_from(ket)))
+    np.testing.assert_allclose(output, ket, atol=1e-12)
+
+
 # ----------------------------------------------------------------------
 # SumEncoding: controlled variants, walk and QSVT consumers
 # ----------------------------------------------------------------------
@@ -202,6 +245,62 @@ def test_sum_controlled_apply_control_conventions():
     np.testing.assert_allclose(at_one[:dim],
                                dense @ ket / encoding.alpha,
                                atol=1e-12)
+
+
+def test_sum_controlled_apply_fourth_negative_slot_matches_dense():
+    encoding, dense, _ = _sum_case("four-slot-negative-all-ones")
+    ket = random_ket(NUM_QUBITS, 18)
+    dim = 1 << NUM_QUBITS
+
+    at_zero = np.array(
+        cudaq.get_state(_controlled_circuit(encoding, 0), state_from(ket)))
+    expected = np.zeros_like(at_zero)
+    expected[:dim] = ket
+    np.testing.assert_allclose(at_zero, expected, atol=1e-12)
+
+    at_one = np.array(
+        cudaq.get_state(_controlled_circuit(encoding, 1), state_from(ket)))
+    np.testing.assert_allclose(at_one[:dim],
+                               dense @ ket / encoding.alpha,
+                               atol=1e-12)
+
+
+@pytest.mark.parametrize("control_value", [0, 1])
+def test_sum_controlled_walk_step_respects_control(control_value):
+    encoding, _, _ = _sum_case("three-mixed-widths")
+    ket = random_ket(NUM_QUBITS, 17)
+    n_ancilla = encoding.num_ancilla
+    controlled_step = encoding.controlled_walk_step_kernel()
+    walk_step = encoding.walk_step_kernel()
+
+    @cudaq.kernel
+    def controlled_probe(state: cudaq.State):
+        system = cudaq.qvector(state)
+        control_and_ancilla = cudaq.qvector(n_ancilla + 1)
+        if control_value == 1:
+            x(control_and_ancilla[0])
+        controlled_step(control_and_ancilla, system)
+
+    @cudaq.kernel
+    def reference_probe(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(n_ancilla)
+        walk_step(ancilla, system)
+
+    reference = np.asarray(cudaq.get_state(reference_probe,
+                                           state_from(ket))).reshape(
+                                               1 << n_ancilla, 1 << NUM_QUBITS)
+    controlled = np.asarray(cudaq.get_state(controlled_probe,
+                                            state_from(ket))).reshape(
+                                                1 << n_ancilla, 2,
+                                                1 << NUM_QUBITS)
+
+    expected = np.zeros_like(controlled)
+    if control_value == 0:
+        expected[0, 0] = ket
+    else:
+        expected[:, 1, :] = reference
+    np.testing.assert_allclose(controlled, expected, atol=1e-10)
 
 
 @pytest.mark.parametrize("control_value", [0, 1])
@@ -226,6 +325,80 @@ def test_sum_walk_kernel_applies_chebyshev_of_minus_h():
         np.testing.assert_allclose(block,
                                    _chebyshev(scaled, power, ket),
                                    atol=1e-12)
+
+
+def test_walk_step_adjoint_backend_paths():
+    terms = {"ZII": 1.0, "IXI": -1.0}
+    exact = PauliLCU(terms)
+    alias = PauliLCU(terms, backend="alias", mu=1)
+    sum_encoding, sum_dense, _ = _sum_case("two-mixed-sign")
+    encodings = [(exact, _dense(exact)), (alias, _dense(alias)),
+                 (sum_encoding, sum_dense)]
+    ket = random_ket(NUM_QUBITS, 29)
+
+    def probes(encoding):
+        prepare = encoding.prepare_kernel()
+        unprepare = encoding.unprepare_kernel()
+        walk_step = encoding.walk_step_kernel()
+        adjoint_walk_step = encoding.adjoint_walk_step_kernel()
+        num_ancilla = encoding.num_ancilla
+
+        @cudaq.kernel
+        def prepared_walk(state: cudaq.State):
+            system = cudaq.qvector(state)
+            ancilla = cudaq.qvector(num_ancilla)
+            prepare(ancilla)
+            walk_step(ancilla, system)
+            unprepare(ancilla)
+
+        @cudaq.kernel
+        def walk_roundtrip(state: cudaq.State):
+            system = cudaq.qvector(state)
+            ancilla = cudaq.qvector(num_ancilla)
+            walk_step(ancilla, system)
+            adjoint_walk_step(ancilla, system)
+
+        return prepared_walk, walk_roundtrip
+
+    for encoding, dense in encodings:
+        prepared_walk, walk_roundtrip = probes(encoding)
+        block = _block(encoding, prepared_walk, ket)
+        np.testing.assert_allclose(block,
+                                   -dense @ ket / encoding.alpha,
+                                   atol=1e-10)
+
+        output = np.asarray(cudaq.get_state(walk_roundtrip, state_from(ket)))
+        expected = np.zeros(1 << (encoding.num_system + encoding.num_ancilla),
+                            dtype=np.complex128)
+        expected[:1 << encoding.num_system] = ket
+        np.testing.assert_allclose(output, expected, atol=1e-10)
+
+
+def test_sum_adjoint_walk_step_restores_nonzero_ancilla():
+    encoding, _, _ = _sum_case("five-repeated")
+    adjoint_walk_step = encoding.adjoint_walk_step_kernel()
+    walk_step = encoding.walk_step_kernel()
+    num_ancilla = encoding.num_ancilla
+    num_slots = encoding.num_slots
+    ket = random_ket(NUM_QUBITS, 31)
+
+    @cudaq.kernel
+    def roundtrip(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(num_ancilla)
+        x(ancilla[0])
+        x(ancilla[num_slots])
+        x(ancilla[num_slots + 1])
+        adjoint_walk_step(ancilla, system)
+        walk_step(ancilla, system)
+
+    output = np.asarray(cudaq.get_state(roundtrip, state_from(ket)))
+    ancilla_basis = (1 << 0) | (1 << num_slots) | (1 << (num_slots + 1))
+    expected = np.zeros(1 << (encoding.num_system + num_ancilla),
+                        dtype=np.complex128)
+    start = ancilla_basis << encoding.num_system
+    expected[start:start + ket.size] = ket
+    np.testing.assert_allclose(output, expected, atol=1e-10)
 
 
 def test_sum_walk_even_moments_match_dense():
@@ -304,6 +477,29 @@ def test_rotated_block_is_rotated_operator_over_alpha(n, seed):
     np.testing.assert_allclose(block, dense @ ket / rotated.alpha, atol=1e-12)
 
 
+def test_rotated_encode_kernel_with_injected_state_prep():
+    rotated, dense, nq = _rotated_case(2, 5)
+
+    @cudaq.kernel
+    def prep(qubits: cudaq.qview):
+        x(qubits[0])
+        h(qubits[3])
+
+    ket = np.zeros(1 << nq, dtype=np.complex128)
+    ket[0b0001] = ket[0b1001] = 1.0 / np.sqrt(2.0)
+    via_prep = np.asarray(cudaq.get_state(
+        rotated.encode_kernel(state_prep=prep)),
+                          dtype=np.complex128)
+    via_state = np.asarray(cudaq.get_state(rotated.encode_kernel(),
+                                           state_from(ket)),
+                           dtype=np.complex128)
+
+    np.testing.assert_allclose(via_prep, via_state, atol=1e-12)
+    np.testing.assert_allclose(via_prep[:1 << nq],
+                               dense @ ket / rotated.alpha,
+                               atol=1e-12)
+
+
 def test_rotated_controlled_and_walk_kernels():
     rotated, dense, nq = _rotated_case(2, 5)
     ket = random_ket(nq, 10)
@@ -338,6 +534,73 @@ def test_rotated_controlled_and_walk_kernels():
         rotated.select_observable()
 
 
+def test_rotated_walk_step_and_adjoint_factories():
+    rotated, dense, nq = _rotated_case(2, 5)
+    ket = random_ket(nq, 31)
+    dim = 1 << nq
+    num_ancilla = rotated.num_ancilla
+    prepare = rotated.prepare_kernel()
+    unprepare = rotated.unprepare_kernel()
+    walk_step = rotated.walk_step_kernel()
+    adjoint = rotated.adjoint_walk_step_kernel()
+
+    @cudaq.kernel
+    def apply_step(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(num_ancilla)
+        prepare(ancilla)
+        walk_step(ancilla, system)
+        unprepare(ancilla)
+
+    step_out = np.asarray(cudaq.get_state(apply_step, state_from(ket)))
+    np.testing.assert_allclose(step_out[:dim], (-dense / rotated.alpha) @ ket,
+                               atol=1e-12)
+
+    @cudaq.kernel
+    def roundtrip(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(num_ancilla)
+        walk_step(ancilla, system)
+        adjoint(ancilla, system)
+
+    expected = np.zeros(1 << (nq + num_ancilla), dtype=np.complex128)
+    expected[:dim] = ket
+    roundtrip_out = np.asarray(cudaq.get_state(roundtrip, state_from(ket)))
+    np.testing.assert_allclose(roundtrip_out, expected, atol=1e-12)
+
+
+def test_rotated_explicit_kernel_adjoint_walk_step_restores_nonzero_ancilla():
+    inner = PauliLCU({"XII": 0.6, "IZZ": -0.4})
+
+    @cudaq.kernel
+    def enter(system: cudaq.qview):
+        s.adj(system[0])
+
+    @cudaq.kernel
+    def exit(system: cudaq.qview):
+        s(system[0])
+
+    rotated = RotatedEncoding(inner, enter, exit)
+    num_system = rotated.num_system
+    num_ancilla = rotated.num_ancilla
+    ket = random_ket(num_system, 37)
+    walk_step = rotated.walk_step_kernel()
+    adjoint = rotated.adjoint_walk_step_kernel()
+
+    @cudaq.kernel
+    def roundtrip(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(num_ancilla)
+        x(ancilla[0])
+        walk_step(ancilla, system)
+        adjoint(ancilla, system)
+
+    output = np.asarray(cudaq.get_state(roundtrip, state_from(ket)))
+    expected = np.zeros(1 << (num_system + num_ancilla), dtype=np.complex128)
+    expected[1 << num_system:(1 << num_system) + ket.size] = ket
+    np.testing.assert_allclose(output, expected, atol=1e-12)
+
+
 def test_rotated_with_explicit_kernels():
     """A user-supplied basis change: conjugate Z words by Hadamards."""
     inner = PauliLCU({"ZI": 0.6, "IZ": -0.4})
@@ -356,9 +619,43 @@ def test_rotated_with_explicit_kernels():
                                atol=1e-12)
 
 
+def test_pair_composes_kernels_in_order():
+
+    @cudaq.kernel
+    def first(ancilla: cudaq.qview, system: cudaq.qview):
+        x(ancilla[0])
+        x(system[0])
+
+    @cudaq.kernel
+    def second(ancilla: cudaq.qview, system: cudaq.qview):
+        h(system[0])
+
+    paired = _pair(first, second)
+
+    @cudaq.kernel
+    def circuit(state: cudaq.State):
+        system = cudaq.qvector(state)
+        ancilla = cudaq.qvector(1)
+        paired(ancilla, system)
+
+    initial = np.array([1.0, 0.0], dtype=np.complex128)
+    output = np.asarray(cudaq.get_state(circuit, state_from(initial)))
+    expected = np.array([0.0, 0.0, 1.0, -1.0],
+                        dtype=np.complex128) / np.sqrt(2.0)
+    np.testing.assert_allclose(output, expected, atol=1e-12)
+
+
 @cudaq.kernel
 def _identity_system_kernel(system: cudaq.qview):
     pass
+
+
+def test_rotated_repr_includes_inner_encoding():
+    inner = PauliLCU({"ZIII": 0.5})
+    rotated = RotatedEncoding(inner, _identity_system_kernel,
+                              _identity_system_kernel)
+
+    assert repr(rotated) == f"RotatedEncoding({inner!r})"
 
 
 def test_rotated_orbital_rotation_validation():
@@ -571,6 +868,39 @@ def test_orbital_rotation_frame_realizes_the_matrix_exactly():
         np.testing.assert_allclose(enter_matrix, swap.T, atol=1e-12)
 
 
+@pytest.mark.parametrize(
+    "orthogonal, has_negative_sign",
+    [
+        (np.eye(2), False),
+        (np.diag([-1.0, 1.0]), True),
+    ],
+    ids=["identity-sentinel", "negative-mode-sign"],
+)
+def test_orbital_rotation_exit_covers_flip_sentinel_and_mode_sign(
+        orthogonal, has_negative_sign):
+    rotated = RotatedEncoding.from_orbital_rotation(PauliLCU({"ZIII": 0.5}),
+                                                    orthogonal)
+    assert rotated.mode_signs is not None
+    assert (-1 in rotated.mode_signs) is has_negative_sign
+
+    for spin in (0, 1):
+        exit_matrix, leak = _one_particle_matrix(rotated._exit, 2, spin)
+        assert leak < 1e-12
+        np.testing.assert_allclose(exit_matrix, orthogonal, atol=1e-12)
+
+
+def test_orbital_rotation_enter_identity_sign_sentinel():
+    rotated = RotatedEncoding.from_orbital_rotation(PauliLCU({"ZIII": 0.5}),
+                                                    np.eye(2))
+    assert rotated.mode_signs == (1, 1)
+    assert rotated.num_rotations == 0
+
+    for spin in (0, 1):
+        enter_matrix, leak = _one_particle_matrix(rotated._enter, 2, spin)
+        assert leak < 1e-12
+        np.testing.assert_allclose(enter_matrix, np.eye(2), atol=1e-12)
+
+
 # ----------------------------------------------------------------------
 # Guards added at the factory boundary
 # ----------------------------------------------------------------------
@@ -588,6 +918,17 @@ class _ZeroAncilla:
         return getattr(self._inner, name)
 
 
+class _AlphaOverride:
+    """A protocol-shaped wrapper exposing a chosen alpha value."""
+
+    def __init__(self, inner, alpha):
+        self._inner = inner
+        self.alpha = alpha
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def test_sum_rejects_complex_string_and_ancilla_free_operands():
     a = _encoding(TERMS_A)
     with pytest.raises(ValueError, match="complex"):
@@ -596,6 +937,13 @@ def test_sum_rejects_complex_string_and_ancilla_free_operands():
         SumEncoding([("2.0", a)])
     with pytest.raises(ValueError, match="at least one ancilla"):
         SumEncoding([(1.0, _ZeroAncilla(a))])
+
+
+@pytest.mark.parametrize("alpha", [0.0, -1.0, float("nan"), float("inf")])
+def test_sum_rejects_nonpositive_or_nonfinite_operand_alpha(alpha):
+    encoding = _AlphaOverride(_encoding(TERMS_A), alpha)
+    with pytest.raises(ValueError, match="positive finite alpha"):
+        SumEncoding([(1.0, encoding)])
 
 
 def test_rotated_rejects_non_kernels_and_degenerate_rotations():

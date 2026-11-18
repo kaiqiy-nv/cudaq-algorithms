@@ -12,6 +12,9 @@ import cudaq
 from cudaq_algorithms import sim_utils as sim
 from cudaq_algorithms import (ADJOINT, FORWARD, PauliLCU, PhaseSequence, QSVT,
                               recover_real_time_evolution, state_from)
+from cudaq_algorithms.common_kernels import (controlled_reflect_about_zero,
+                                             controlled_signal_phase,
+                                             signal_phase)
 from dense_references import dense_matrix, random_ket
 
 
@@ -57,6 +60,11 @@ TWO_TERMS_1Q = {"X": 0.5, "Z": 0.3}
 FOUR_TERMS_2Q = {"ZI": 0.70, "IZ": -0.43, "XX": 0.19, "YZ": 0.11}
 
 
+def test_qsvt_repr_includes_encoding():
+    enc = PauliLCU(TWO_TERMS_1Q)
+    assert repr(QSVT(enc)) == f"QSVT({enc!r})"
+
+
 def test_phase_sequence_validation_and_conversion():
     seq = PhaseSequence([0.1, -0.2, 0.3])
     assert seq.degree == 2
@@ -80,6 +88,38 @@ def test_phase_sequence_validation_and_conversion():
         PhaseSequence([0.1, 0.2], walk_directions=["sideways"])
     with pytest.raises(ValueError):
         PhaseSequence([0.1], convention="phaseish")
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_phase_sequence_rejects_nonfinite_phases(phase):
+    with pytest.raises(ValueError, match="phases must be finite"):
+        PhaseSequence([0.1, phase])
+
+
+@pytest.mark.parametrize(
+    ("phases", "convention", "expected"),
+    [
+        pytest.param([0.1],
+                     "qsvt",
+                     "PhaseSequence(degree=0, convention='qsvt')",
+                     id="degree-zero-qsvt"),
+        pytest.param([0.1, -0.2, 0.3],
+                     "qsp",
+                     "PhaseSequence(degree=2, convention='qsp')",
+                     id="degree-two-qsp"),
+    ],
+)
+def test_phase_sequence_repr_reports_degree_and_convention(
+        phases, convention, expected):
+    sequence = PhaseSequence(phases, convention=convention)
+    assert repr(sequence) == expected
 
 
 def test_response_matches_circuit_on_eigenstate():
@@ -124,6 +164,95 @@ def test_full_block_matches_host_model_with_mixed_directions():
         [reference_response(seq, float(m)) for m in eigenvalues])
     host_block = eigenvectors @ np.diag(response) @ eigenvectors.conj().T
     assert np.allclose(device_block, host_block, atol=1e-9)
+
+
+def test_qsvt_prepared_and_state_kernels_match_dense_mixed_direction_reference(
+):
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    transformer = QSVT(enc)
+    sequence = PhaseSequence([0.3, -0.4, 0.25],
+                             walk_directions=[FORWARD, ADJOINT])
+
+    @cudaq.kernel
+    def prepare_zero(system: cudaq.qview):
+        pass
+
+    matrix = dense_matrix([(coefficient, word)
+                           for word, coefficient in FOUR_TERMS_2Q.items()], 2)
+    eigenvalues, eigenvectors = np.linalg.eigh(matrix / enc.alpha)
+    response = np.array(
+        [reference_response(sequence, float(value)) for value in eigenvalues])
+    host_block = eigenvectors @ np.diag(response) @ eigenvectors.conj().T
+    ket = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
+    expected = host_block @ ket
+
+    prepared_state = np.asarray(
+        cudaq.get_state(transformer.kernel(sequence, state_prep=prepare_zero)))
+    input_state = np.asarray(
+        cudaq.get_state(transformer.kernel(sequence), state_from(ket)))
+    np.testing.assert_allclose(prepared_state[:4], expected, atol=1e-9)
+    np.testing.assert_allclose(input_state[:4], expected, atol=1e-9)
+
+    @cudaq.kernel
+    def empty_signal_phase_probe():
+        register = cudaq.qvector(1)
+        signal_phase(register.front(0), 0.7)
+
+    empty_view_state = np.asarray(cudaq.get_state(empty_signal_phase_probe))
+    np.testing.assert_allclose(empty_view_state, [1.0, 0.0], atol=1e-12)
+
+
+def test_controlled_prepared_sequence_matches_state_kernel_and_disabled_identity(
+):
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    transformer = QSVT(enc)
+    sequence = PhaseSequence([0.3, -0.4, 0.25],
+                             walk_directions=[FORWARD, ADJOINT])
+
+    @cudaq.kernel
+    def prepare_uniform(system: cudaq.qview):
+        for i in range(2):
+            h(system[i])
+
+    uniform_ket = np.full(4, 0.5, dtype=np.complex128)
+    prepared_controlled = np.asarray(
+        cudaq.get_state(
+            transformer.controlled_kernel(sequence,
+                                          control_state=1,
+                                          state_prep=prepare_uniform)))
+    state_controlled = np.asarray(
+        cudaq.get_state(
+            transformer.controlled_kernel(sequence, control_state=1),
+            state_from(uniform_ket)))
+    np.testing.assert_allclose(prepared_controlled,
+                               state_controlled,
+                               atol=1e-10)
+
+    disabled = np.asarray(
+        cudaq.get_state(
+            transformer.controlled_kernel(sequence,
+                                          control_state=0,
+                                          state_prep=prepare_uniform)))
+    expected_disabled = np.zeros_like(disabled)
+    expected_disabled[:4] = uniform_ket
+    np.testing.assert_allclose(disabled, expected_disabled, atol=1e-10)
+
+
+def test_controlled_signal_helpers_with_empty_signal_register():
+    phase = 0.37
+
+    @cudaq.kernel
+    def empty_signal_helper_probe(state: cudaq.State):
+        register = cudaq.qvector(state)
+        controlled_signal_phase(register, phase)
+        controlled_reflect_about_zero(register)
+
+    plus = np.full(2, 1.0 / math.sqrt(2.0), dtype=np.complex128)
+    output = np.asarray(
+        cudaq.get_state(empty_signal_helper_probe, state_from(plus)))
+    expected = np.array([1.0, np.exp(1.0j * (phase + math.pi))],
+                        dtype=np.complex128) / math.sqrt(2.0)
+    np.testing.assert_allclose(output, expected, atol=1e-12)
 
 
 def test_qsp_sequence_executes_as_doubled_projector_phases():

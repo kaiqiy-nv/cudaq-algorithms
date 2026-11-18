@@ -12,6 +12,7 @@ instances stay at ``num_bits <= 6``.
 """
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -118,6 +119,11 @@ def test_two_qubit_diagonal_ground_energy():
 # ----------------------------------------------------------------------
 # Validation
 # ----------------------------------------------------------------------
+
+
+def test_init_rejects_zero_ancilla_encoding():
+    with pytest.raises(ValueError, match="encoding.num_ancilla must be >= 1"):
+        PhaseEstimation(SimpleNamespace(num_ancilla=0))
 
 
 def test_validation():
@@ -227,6 +233,51 @@ def test_run_on_large_stack_runs_the_call_on_a_worker_thread():
     assert threading.stack_size() == 0
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ValueError("unsupported stack size"), id="value-error"),
+        pytest.param(RuntimeError("stack size unavailable"),
+                     id="runtime-error"),
+    ],
+)
+def test_run_on_large_stack_falls_back_when_stack_size_rejected(
+        monkeypatch, error):
+    import threading
+
+    from cudaq_algorithms import sim_utils
+
+    caller_thread = threading.current_thread()
+    original_stack_size = threading.stack_size()
+    requested_sizes = []
+    observed = {}
+
+    def reject_stack_size(size=None):
+        if size is None:
+            return original_stack_size
+        requested_sizes.append(size)
+        raise error
+
+    def probe(value, *, suffix):
+        observed["thread"] = threading.current_thread()
+        observed["arguments"] = (value, suffix)
+        return value + suffix
+
+    monkeypatch.setattr(threading, "stack_size", reject_stack_size)
+
+    result = sim_utils.run_on_large_stack(probe,
+                                          "fallback",
+                                          stack_bytes=131072,
+                                          suffix=" path")
+
+    assert result == "fallback path"
+    assert requested_sizes == [131072]
+    assert observed == {
+        "thread": caller_thread,
+        "arguments": ("fallback", " path"),
+    }
+
+
 def test_phase_probabilities_simulates_on_the_large_stack(monkeypatch):
     # The 2^m - 1 walk steps grow the host stack by about 1 kB each on the
     # simulator (captured tables re-materialized per loop iteration), so
@@ -256,6 +307,24 @@ def test_phase_probabilities_simulates_on_the_large_stack(monkeypatch):
 @cudaq.kernel
 def prep_1(q: cudaq.qview):
     x(q[0])
+
+
+def test_kernel_factory_modes_agree_on_exact_eigenphase():
+    enc = PauliLCU({"Z": 0.5})
+    qpe = PhaseEstimation(enc)
+    m = 2
+    ket = np.array([0.0, 1.0], dtype=complex)
+    expected = np.zeros(1 << m)
+    expected[0] = 1.0
+
+    from_state = sim.qpe.phase_probabilities(qpe, m, ket=state_from(ket))
+    from_prep = sim.qpe.phase_probabilities(qpe, m, state_prep=prep_1)
+    np.testing.assert_allclose(from_state, expected, atol=1e-12)
+    np.testing.assert_allclose(from_prep, expected, atol=1e-12)
+
+    counts = cudaq.sample(qpe.kernel(m, state_prep=prep_1, measure=True),
+                          shots_count=32)
+    assert {bits for bits, _ in counts.items()} == {"0" * m}
 
 
 def test_measured_circuit_counts_decode_to_the_energy():
@@ -301,6 +370,22 @@ def test_counts_decoder_matches_the_statevector_marginal():
                                                           top=1)[0][0],
                                          abs=1e-12)
     assert ranked[0][1] > 0.8
+
+
+def test_state_measured_counts_match_statevector_marginal():
+    enc = PauliLCU({"Z": 0.3, "X": 0.4})
+    qpe = PhaseEstimation(enc)
+    m = 3
+    ket = np.array([1.0, 0.0], dtype=complex)
+    exact = sim.qpe.phase_probabilities(qpe, m, ket=ket)
+    cudaq.set_random_seed(7)
+    counts = cudaq.sample(qpe.kernel(m, measure=True),
+                          state_from(ket),
+                          shots_count=4000)
+    assert {len(bits) for bits, _ in counts.items()} == {m}
+    sampled = qpe.phase_probabilities_from_counts(counts, m)
+    assert sampled.sum() == pytest.approx(1.0, abs=1e-12)
+    np.testing.assert_allclose(sampled, exact, atol=0.04)
 
 
 def test_counts_decoder_slices_full_register_strings_and_takes_mappings():

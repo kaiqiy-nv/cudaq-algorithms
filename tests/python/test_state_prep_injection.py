@@ -82,6 +82,32 @@ def test_walk_factories_prep_injection():
                                    err_msg=f"{factory.__name__} {kwargs}")
 
 
+def test_single_term_roundtrip_kernel_prep_matches_prepared_state():
+    walk = Walk(PauliLCU({"XZ": -0.5}))
+    actual = _state(walk.roundtrip_kernel(power=1, state_prep=product_prep))
+
+    expected = np.zeros(1 <<
+                        (walk.encoding.num_system + walk.encoding.num_ancilla),
+                        dtype=np.complex128)
+    expected[:1 << walk.encoding.num_system] = _prepared_ket()
+
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+
+def test_controlled_roundtrip_prep_control_zero():
+    walk = Walk(PauliLCU(HAMILTONIAN))
+    kernel = walk.controlled_roundtrip_kernel(power=1,
+                                              control_state=0,
+                                              state_prep=product_prep)
+    actual = _state(kernel)
+    expected = np.zeros(
+        1 << (walk.encoding.num_system + 1 + walk.encoding.num_ancilla),
+        dtype=np.complex128)
+    expected[:1 << walk.encoding.num_system] = _prepared_ket()
+
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+
+
 def test_qsvt_kernels_prep_injection():
     transformer = QSVT(PauliLCU(HAMILTONIAN))
     sequence = PhaseSequence([0.4, -0.2, 0.7],

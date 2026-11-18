@@ -318,3 +318,22 @@ def test_mapping_validation_errors():
                                 num_modes=2)
     with pytest.raises(ValueError, match="non-finite"):
         jordan_wigner(np.array([[0.0, np.inf], [0.0, 0.0]]))
+
+
+@pytest.mark.parametrize("first,second,error", [
+    pytest.param(np.zeros((2, 3)),
+                 None,
+                 "one_body dimensions must match",
+                 id="one_body-not-square"),
+    pytest.param(np.zeros((2, 2, 2, 3)),
+                 None,
+                 "two_body dimensions must match",
+                 id="two_body-alone-not-uniform"),
+    pytest.param(np.zeros((2, 2)),
+                 np.zeros((2, 2, 2, 3)),
+                 "two_body dimensions must match",
+                 id="two_body-not-uniform"),
+])
+def test_dense_integral_shape_validation(first, second, error):
+    with pytest.raises(ValueError, match=error):
+        _normalize_integrals(first, second)

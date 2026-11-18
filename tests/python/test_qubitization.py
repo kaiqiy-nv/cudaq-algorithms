@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Correctness tests for qubitization walks and moments (dense references)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -26,6 +28,11 @@ def exact_chebyshev_moments(terms, num_qubits, alpha, ket, count):
 
 THREE_TERMS_1Q = {"I": 0.2, "X": 0.5, "Z": 0.3}  # asymmetric spectrum
 FOUR_TERMS_2Q = {"ZI": 0.70, "IZ": -0.43, "XX": 0.19, "YZ": 0.11}
+
+
+def test_walk_repr_includes_inner_encoding():
+    encoding = PauliLCU(THREE_TERMS_1Q)
+    assert repr(Walk(encoding)) == f"Walk({encoding!r})"
 
 
 def test_moments_match_dense_chebyshev_1q():
@@ -72,6 +79,20 @@ def test_adjoint_walk_inverts_walk():
             f"roundtrip failed at power {power}"
 
 
+def test_single_term_roundtrip_preserves_full_state():
+    enc = PauliLCU({"X": -1.0})
+    assert enc.num_ancilla == 1
+    ket = random_ket(enc.num_system, seed=29)
+
+    state = np.asarray(
+        cudaq.get_state(Walk(enc).roundtrip_kernel(power=1), state_from(ket)))
+    expected = np.zeros(1 << (enc.num_system + enc.num_ancilla),
+                        dtype=np.complex128)
+    expected[:1 << enc.num_system] = ket
+
+    np.testing.assert_allclose(state, expected, atol=1e-10)
+
+
 def test_walk_kernel_options():
     enc = PauliLCU(THREE_TERMS_1Q)
     walk = Walk(enc)
@@ -83,6 +104,113 @@ def test_walk_kernel_options():
     assert np.allclose(a, b, atol=1e-12)
 
 
+def test_walk_uncompute_single_step_matches_dense_block():
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    ket = random_ket(enc.num_system, seed=47)
+
+    state = np.asarray(
+        cudaq.get_state(Walk(enc).kernel(power=1), state_from(ket)))
+    projected_system = state[:1 << enc.num_system]
+    terms = [(coefficient, word)
+             for word, coefficient in FOUR_TERMS_2Q.items()]
+    hamiltonian = dense_matrix(terms, enc.num_system)
+    expected_system = -(hamiltonian @ ket) / enc.alpha
+
+    np.testing.assert_allclose(projected_system,
+                               expected_system,
+                               atol=1e-12,
+                               rtol=0.0)
+
+
+def test_walk_prepared_without_uncompute_matches_dense_chebyshev():
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    ket = random_ket(enc.num_system, seed=53)
+    state = np.asarray(cudaq.get_state(
+        Walk(enc).kernel(power=2, uncompute=False), state_from(ket)),
+                       dtype=np.complex128)
+
+    n_ancilla = enc.num_ancilla
+    prepare = enc.prepare_kernel()
+
+    @cudaq.kernel
+    def prepare_ancilla_state():
+        ancilla = cudaq.qvector(n_ancilla)
+        prepare(ancilla)
+
+    prepare_state = np.asarray(cudaq.get_state(prepare_ancilla_state),
+                               dtype=np.complex128)
+    projected_system = np.array([
+        sum(
+            np.conjugate(prepare_state[anc]) * state[sys +
+                                                     (anc << enc.num_system)]
+            for anc in range(1 << n_ancilla))
+        for sys in range(1 << enc.num_system)
+    ],
+                                dtype=np.complex128)
+
+    hamiltonian = dense_matrix(
+        [(coefficient, word) for word, coefficient in FOUR_TERMS_2Q.items()],
+        enc.num_system)
+    scaled = hamiltonian / enc.alpha
+    expected_system = (2.0 *
+                       (scaled @ scaled) - np.eye(1 << enc.num_system)) @ ket
+
+    np.testing.assert_allclose(projected_system,
+                               expected_system,
+                               atol=1e-12,
+                               rtol=0.0)
+
+
+def test_prepared_adjoint_walk_without_uncompute_matches_references():
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    walk = Walk(enc)
+
+    @cudaq.kernel
+    def prep(system: cudaq.qview):
+        h(system[0])
+        x(system[1])
+
+    expected_ket = np.array([0.0, 0.0, 1 / np.sqrt(2), 1 / np.sqrt(2)],
+                            dtype=np.complex128)
+    prepared = np.asarray(cudaq.get_state(
+        walk.adjoint_kernel(power=1, uncompute=False, state_prep=prep)),
+                          dtype=np.complex128)
+    reference = np.asarray(cudaq.get_state(
+        walk.adjoint_kernel(power=1, uncompute=False),
+        state_from(expected_ket)),
+                           dtype=np.complex128)
+    np.testing.assert_allclose(prepared, reference, atol=1e-12, rtol=0.0)
+
+    prepare_ancilla = enc.prepare_kernel()
+    n_ancilla = enc.num_ancilla
+
+    @cudaq.kernel
+    def prepare_ancilla_state():
+        ancilla = cudaq.qvector(n_ancilla)
+        prepare_ancilla(ancilla)
+
+    prepare_state = np.asarray(cudaq.get_state(prepare_ancilla_state),
+                               dtype=np.complex128)
+    projected_system = np.array([
+        sum(
+            np.conjugate(prepare_state[anc]) *
+            reference[sys + (anc << enc.num_system)]
+            for anc in range(1 << n_ancilla))
+        for sys in range(1 << enc.num_system)
+    ],
+                                dtype=np.complex128)
+
+    terms = [(coefficient, word)
+             for word, coefficient in FOUR_TERMS_2Q.items()]
+    hamiltonian = dense_matrix(terms, enc.num_system)
+    expected_action = -(hamiltonian @ expected_ket) / enc.alpha
+
+    np.testing.assert_allclose(projected_system,
+                               expected_action,
+                               atol=1e-12,
+                               rtol=0.0)
+
+
 def test_reflection_and_select_observables_shapes():
     enc = PauliLCU(FOUR_TERMS_2Q)
     reflection = reflection_observable(enc)
@@ -91,6 +219,18 @@ def test_reflection_and_select_observables_shapes():
     # (Full physics is covered by the moment tests.)
     assert reflection is not None
     assert select is not None
+
+
+def test_reflection_observable_rejects_wide_ancilla_register():
+    encoding = SimpleNamespace(num_system=1, num_ancilla=21)
+
+    with pytest.raises(ValueError) as exc_info:
+        reflection_observable(encoding)
+
+    assert str(exc_info.value) == (
+        "the reflection observable over 21 ancillas would expand to 2^21 "
+        "Pauli terms; even-order moments are impractical for this encoding "
+        "-- apply walk_kernel(power=...) and measure directly instead")
 
 
 def test_single_term_encoding_walks_with_correct_sign():
@@ -175,6 +315,45 @@ def test_controlled_walk_respects_control():
             assert abs(off_state[con_index(sys, 1, anc)]) < 1e-10
 
 
+@pytest.mark.parametrize("control_state", (0, 1))
+def test_controlled_walk_one_term_matches_dense_action(control_state):
+    terms = {"X": -1.0}
+    enc = PauliLCU(terms)
+    walk = Walk(enc)
+    ket = random_ket(enc.num_system, seed=31)
+    unc_index, con_index = _controlled_layout_maps(enc.num_system,
+                                                   enc.num_ancilla)
+
+    actual = np.asarray(
+        cudaq.get_state(
+            walk.controlled_kernel(power=1, control_state=control_state),
+            state_from(ket)))
+    expected = np.zeros_like(actual)
+
+    if control_state == 0:
+        for sys in range(1 << enc.num_system):
+            expected[con_index(sys, 0, 0)] = ket[sys]
+    else:
+        reference = np.asarray(
+            cudaq.get_state(walk.kernel(power=1), state_from(ket)))
+        for anc in range(1 << enc.num_ancilla):
+            for sys in range(1 << enc.num_system):
+                expected[con_index(sys, 1,
+                                   anc)] = reference[unc_index(sys, anc)]
+
+        projected_system = np.array([
+            actual[con_index(sys, 1, 0)] for sys in range(1 << enc.num_system)
+        ])
+        dense_hamiltonian = dense_matrix([(-1.0, "X")], enc.num_system)
+        expected_action = -dense_hamiltonian @ ket / enc.alpha
+        np.testing.assert_allclose(projected_system,
+                                   expected_action,
+                                   atol=1e-10,
+                                   rtol=0.0)
+
+    np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=0.0)
+
+
 def test_controlled_adjoint_walk_inverts_controlled_walk():
     enc = PauliLCU(FOUR_TERMS_2Q)
     walk = Walk(enc)
@@ -193,3 +372,144 @@ def test_controlled_adjoint_walk_inverts_controlled_walk():
                 assert state[con_index(sys, control_state,
                                        anc)] == pytest.approx(expected,
                                                               abs=1e-10)
+
+
+@pytest.mark.parametrize("control_state", (0, 1))
+def test_controlled_single_term_roundtrip_preserves_full_state(control_state):
+    enc = PauliLCU({"X": -1.0})
+    assert enc.num_ancilla == 1
+    walk = Walk(enc)
+    ket = random_ket(enc.num_system, seed=23)
+    _, con_index = _controlled_layout_maps(enc.num_system, enc.num_ancilla)
+
+    kernel = walk.controlled_roundtrip_kernel(power=1,
+                                              control_state=control_state)
+    state = np.asarray(cudaq.get_state(kernel, state_from(ket)))
+    expected = np.zeros(1 << (enc.num_system + 1 + enc.num_ancilla),
+                        dtype=np.complex128)
+    for sys in range(1 << enc.num_system):
+        expected[con_index(sys, control_state, 0)] = ket[sys]
+
+    np.testing.assert_allclose(state, expected, atol=1e-10)
+
+
+@pytest.mark.parametrize("control_state", (0, 1))
+def test_controlled_prepared_walk_statevectors_match_references(control_state):
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    walk = Walk(enc)
+
+    @cudaq.kernel
+    def prep(system: cudaq.qview):
+        h(system[0])
+        x(system[1])
+
+    expected_ket = np.array([0.0, 0.0, 1 / np.sqrt(2), 1 / np.sqrt(2)],
+                            dtype=np.complex128)
+    actual = np.asarray(
+        cudaq.get_state(
+            walk.controlled_kernel(power=1,
+                                   control_state=control_state,
+                                   uncompute=False,
+                                   state_prep=prep)))
+
+    reference_power = 1 if control_state == 1 else 0
+    reference = np.asarray(
+        cudaq.get_state(
+            walk.kernel(power=reference_power,
+                        uncompute=False,
+                        state_prep=prep)))
+    unc_index, con_index = _controlled_layout_maps(enc.num_system,
+                                                   enc.num_ancilla)
+    expected = np.zeros_like(actual)
+    for anc in range(1 << enc.num_ancilla):
+        for sys in range(1 << enc.num_system):
+            expected[con_index(sys, control_state,
+                               anc)] = reference[unc_index(sys, anc)]
+
+    np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0.0)
+
+    if control_state == 1:
+        prepare_ancilla = enc.prepare_kernel()
+        n_ancilla = enc.num_ancilla
+
+        @cudaq.kernel
+        def prepare_ancilla_state():
+            ancilla = cudaq.qvector(n_ancilla)
+            prepare_ancilla(ancilla)
+
+        prepare_state = np.asarray(cudaq.get_state(prepare_ancilla_state),
+                                   dtype=np.complex128)
+        projected_system = np.array([
+            sum(
+                np.conjugate(prepare_state[anc]) *
+                reference[unc_index(sys, anc)]
+                for anc in range(1 << enc.num_ancilla))
+            for sys in range(1 << enc.num_system)
+        ],
+                                    dtype=np.complex128)
+        expected_action = (
+            -dense_matrix([(coefficient, word)
+                           for word, coefficient in FOUR_TERMS_2Q.items()], 2)
+            @ expected_ket / enc.alpha)
+        np.testing.assert_allclose(projected_system,
+                                   expected_action,
+                                   atol=1e-12,
+                                   rtol=0.0)
+
+
+@pytest.mark.parametrize("control_state", (0, 1))
+def test_controlled_prepared_walk_without_state_prep_matches_references(
+        control_state):
+    enc = PauliLCU(FOUR_TERMS_2Q)
+    walk = Walk(enc)
+    ket = random_ket(enc.num_system, seed=31)
+    unc_index, con_index = _controlled_layout_maps(enc.num_system,
+                                                   enc.num_ancilla)
+
+    actual = np.asarray(
+        cudaq.get_state(
+            walk.controlled_kernel(power=1,
+                                   control_state=control_state,
+                                   uncompute=False), state_from(ket)))
+    active_reference = np.asarray(
+        cudaq.get_state(walk.kernel(power=1, uncompute=False),
+                        state_from(ket)))
+    inactive_reference = np.asarray(
+        cudaq.get_state(walk.kernel(power=0, uncompute=False),
+                        state_from(ket)))
+
+    reference = active_reference if control_state == 1 else inactive_reference
+    expected = np.zeros_like(actual)
+    for anc in range(1 << enc.num_ancilla):
+        for sys in range(1 << enc.num_system):
+            expected[con_index(sys, control_state,
+                               anc)] = reference[unc_index(sys, anc)]
+
+    np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0.0)
+
+    prepare_ancilla = enc.prepare_kernel()
+    n_ancilla = enc.num_ancilla
+
+    @cudaq.kernel
+    def prepare_ancilla_state():
+        ancilla = cudaq.qvector(n_ancilla)
+        prepare_ancilla(ancilla)
+
+    prepare_state = np.asarray(cudaq.get_state(prepare_ancilla_state),
+                               dtype=np.complex128)
+    if control_state == 1:
+        projected_system = np.array([
+            sum(
+                np.conjugate(prepare_state[anc]) *
+                actual[con_index(sys, control_state, anc)]
+                for anc in range(1 << enc.num_ancilla))
+            for sys in range(1 << enc.num_system)
+        ],
+                                    dtype=np.complex128)
+        expected_action = (-dense_matrix([
+            (coefficient, word) for word, coefficient in FOUR_TERMS_2Q.items()
+        ], enc.num_system) @ ket / enc.alpha)
+        np.testing.assert_allclose(projected_system,
+                                   expected_action,
+                                   atol=1e-12,
+                                   rtol=0.0)

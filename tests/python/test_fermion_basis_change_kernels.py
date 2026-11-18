@@ -5,13 +5,15 @@
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import cudaq
 import numpy as np
 import pytest
 
 from cudaq_algorithms import state_from
-from cudaq_algorithms.basis_change._kernels import (classical_kernel,
+from cudaq_algorithms.basis_change._kernels import (_gate_tape,
+                                                    classical_kernel,
                                                     programmable_kernel)
 from cudaq_algorithms.basis_change._plan import (GivensStructure,
                                                  compile_givens_basis_change)
@@ -291,6 +293,36 @@ def test_classical_inverse_and_control_compose_exactly(controlled, inverse):
                                rtol=0)
 
 
+def test_controlled_classical_full_tape_dispatch():
+    unitary = np.array([[1., 1j], [1j, 1.]]) / np.sqrt(2)
+    unitary = np.diag(np.exp(1j * np.array([0.31, -0.73]))) @ unitary
+    structure = GivensStructure.full(2)
+    schedule = compile_givens_basis_change(unitary, structure=structure)
+    operation = classical_kernel(schedule, controlled=True)
+    expected = np.eye(8, dtype=complex)
+    expected[1::2, 1::2] = _fock_matrix(unitary)
+    np.testing.assert_allclose(_matrix(operation, 3),
+                               expected,
+                               atol=4e-12,
+                               rtol=0)
+
+
+def test_classical_uncontrolled_full_tape_dispatch():
+    unitary = np.array([[1., 1j], [1j, 1.]]) / np.sqrt(2)
+    unitary = np.diag(np.exp(1j * np.array([0.31, -0.73]))) @ unitary
+    schedule = compile_givens_basis_change(unitary,
+                                           structure=GivensStructure.full(2))
+    assert {row[0] for row in _gate_tape(schedule)} == set(range(6))
+
+    operation = classical_kernel(schedule, controlled=False)
+    initial = _random_state(2, seed=1701)
+    actual = _apply(operation, initial)
+    np.testing.assert_allclose(actual,
+                               _fock_matrix(unitary) @ initial,
+                               atol=4e-12,
+                               rtol=0)
+
+
 @pytest.mark.parametrize("kind", ["full", "partial"])
 @pytest.mark.parametrize("controlled, inverse", [
     (False, "forward"),
@@ -400,6 +432,58 @@ def test_three_mode_programmed_partial_matches_complete_joint_state(weight):
                                 _three_mode_partial)
     np.testing.assert_allclose(_apply(operation, initial),
                                expected,
+                               atol=8e-12,
+                               rtol=0)
+
+
+def test_programmed_gapped_three_mode_partial_matches_complete_joint_state():
+    structure = GivensStructure.partial(3,
+                                        reference_mode=2,
+                                        mode_map=(4, 0, 2))
+    schedule = compile_givens_basis_change(structure=structure)
+    weights = (0.63, )
+    layout = _layout(structure, 1)
+    operation = programmable_kernel(schedule, layout, weights)
+    initial = _random_state(structure.num_system_qubits +
+                            structure.num_parameters)
+    expected = _joint_reference(
+        initial, structure, layout, weights,
+        lambda values: _three_mode_partial(values, reference_mode=2))
+    np.testing.assert_allclose(_apply(operation, initial),
+                               expected,
+                               atol=8e-12,
+                               rtol=0)
+
+
+def test_controlled_programmed_word_basis_dispatches_all_opcodes_and_empty_tape(
+):
+    structure = GivensStructure.full(2)
+    schedule = compile_givens_basis_change(structure=structure)
+    layout = _layout(structure, 1)
+    weights = (0.47, )
+    operation = programmable_kernel(schedule, layout, weights, controlled=True)
+    initial = _random_state(7)
+    expected = _joint_reference(
+        initial,
+        structure,
+        layout,
+        weights,
+        lambda values: _two_mode_orbital(values, "full"),
+        controlled=True)
+    np.testing.assert_allclose(_apply(operation, initial),
+                               expected,
+                               atol=8e-12,
+                               rtol=0)
+
+    empty_schedule = SimpleNamespace(operations=(), parameters=())
+    assert _gate_tape(empty_schedule) == ()
+
+    no_op_operation = programmable_kernel(schedule,
+                                          layout, (0., ),
+                                          controlled=True)
+    no_op_initial = _random_state(7, seed=812)
+    np.testing.assert_allclose(_apply(no_op_operation, no_op_initial),
+                               no_op_initial,
                                atol=8e-12,
                                rtol=0)
 

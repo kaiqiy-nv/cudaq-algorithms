@@ -116,6 +116,54 @@ def test_tolerant_parsing_matches_strict():
                                    atol=1e-12)
 
 
+@pytest.mark.parametrize(
+    ("contents", "error", "expected_one_body", "expected_core"),
+    [
+        pytest.param(
+            "\n&FCI\n\nNORB=1\n&END\n-0.75 1 1 0 0\n"
+            "0.125 0 0 0 0\n",
+            None,
+            -0.75,
+            0.125,
+            id="blank-lines-and-bare-fci",
+        ),
+        pytest.param("", "begin with an &FCI", None, None, id="empty-input"),
+        pytest.param(
+            "&FCI NORB=0 &END\n0.5 0 0 0 0\n",
+            "positive integer",
+            None,
+            None,
+            id="zero-norb",
+        ),
+        pytest.param(
+            "&FCI NORB=1 &END\nnot-a-number 1 1 0 0\n",
+            "malformed FCIDUMP integral line",
+            None,
+            None,
+            id="malformed-value",
+        ),
+        pytest.param(
+            "&FCI NORB=1 &END\n0.5 1 0 1 0\n",
+            "unexpected FCIDUMP index pattern",
+            None,
+            None,
+            id="unexpected-index-pattern",
+        ),
+    ],
+)
+def test_from_fcidump_edge_cases(contents, error, expected_one_body,
+                                 expected_core):
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            chemistry.from_fcidump(contents)
+        return
+
+    one_body, eri, core_energy = chemistry.from_fcidump(contents)
+    np.testing.assert_allclose(one_body, [[expected_one_body]], atol=1e-12)
+    np.testing.assert_array_equal(eri, np.zeros((1, 1, 1, 1)))
+    assert core_energy == pytest.approx(expected_core, abs=1e-12)
+
+
 @_needs_fermion
 def test_from_fcidump_spectrum_matches_direct_integrals():
     one_body, eri, core_energy = chemistry.from_fcidump(H2_STO3G_FCIDUMP)

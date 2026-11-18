@@ -230,6 +230,37 @@ def test_shape_inference_and_logical_mode_map_order():
     np.testing.assert_allclose(tape_matrix(schedule)[:, 0], vector, atol=1e-14)
 
 
+@pytest.mark.parametrize(
+    ("structure", "expected"),
+    [
+        (
+            GivensStructure.full(3),
+            (
+                "diagonal_phase[0]",
+                "diagonal_phase[1]",
+                "diagonal_phase[2]",
+                "theta[0]",
+                "phi[0]",
+                "theta[1]",
+                "phi[1]",
+                "theta[2]",
+                "phi[2]",
+            ),
+        ),
+        (
+            GivensStructure.partial(3, reference_mode=1),
+            ("theta[0]", "theta[1]", "phase[0]", "phase[1]", "phase[2]"),
+        ),
+    ],
+)
+def test_parameter_schema_matches_ordered_parameter_names(structure, expected):
+    schema = structure.parameter_schema
+
+    assert isinstance(schema, tuple)
+    assert schema == expected
+    assert schema == structure.parameter_names
+
+
 @pytest.mark.parametrize("kind", ["full", "partial"])
 def test_zero_slots_remain_programmable_without_basis(kind):
     structure = getattr(GivensStructure, kind)(3)
@@ -323,6 +354,16 @@ def test_rejects_invalid_mode_count(m):
         GivensStructure.partial(m)
 
 
+def test_rejects_invalid_structure_kind_and_full_reference_mode():
+    with pytest.raises(ValueError, match="kind must be 'full' or 'partial'"):
+        GivensStructure(2, "invalid")
+
+    with pytest.raises(
+            ValueError,
+            match="reference_mode is only defined for partial structures"):
+        GivensStructure(2, "full", reference_mode=0)
+
+
 @pytest.mark.parametrize("basis", [[1.], [[1.]], [[np.exp(.4j)]], [-1j]])
 def test_rejects_single_mode_basis(basis):
     # One mode admits only a number phase; callers apply r1 directly.
@@ -371,6 +412,22 @@ def test_rejects_inconsistent_structure_or_missing_basis():
             compile_givens_basis_change(basis, structure=structure)
     with pytest.raises(ValueError):
         compile_givens_basis_change()
+
+
+def test_rejects_schedule_constructor_validation_inputs():
+
+    class InvalidArray:
+
+        def __array__(self, dtype=None, copy=None):
+            raise TypeError("not convertible")
+
+    with pytest.raises(
+            ValueError,
+            match="parameters must be a one-dimensional real vector"):
+        GivensBasisChangeSchedule(GivensStructure.full(2), InvalidArray())
+    with pytest.raises(ValueError,
+                       match="structure must be a GivensStructure"):
+        GivensBasisChangeSchedule("full")
 
 
 @pytest.mark.parametrize(

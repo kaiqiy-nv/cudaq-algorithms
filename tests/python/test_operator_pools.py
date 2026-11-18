@@ -3,9 +3,12 @@
 
 import itertools
 
+import cudaq
 import numpy as np
+import pytest
 
 import cudaq_algorithms as algorithms
+from cudaq_algorithms.stateprep._kernels import _double_pauli_rotation
 
 
 def _make_uccsd_operator_pool(num_qubits, num_electrons, spin=0):
@@ -342,3 +345,51 @@ def test_uccsd_double_pool_negates_one_pair_swap():
         matrices.append(actual)
     # The swapped order is the negation of the sorted order.
     assert np.allclose(matrices[1], -matrices[0], atol=1e-10)
+
+
+@cudaq.kernel
+def _double_pauli_rotation_entry(state: cudaq.State, angle: float, i_occ: int,
+                                 j_occ: int, a_virt: int, b_virt: int,
+                                 op_i: int, op_j: int, op_a: int, op_b: int):
+    qubits = cudaq.qvector(state)
+    _double_pauli_rotation(qubits, angle, i_occ, j_occ, a_virt, b_virt, op_i,
+                           op_j, op_a, op_b)
+
+
+def _dense_pair_pauli(num_qubits, first, second, op_first, op_second):
+    labels = ["I"] * num_qubits
+    labels[first] = "X" if op_first == 0 else "Y"
+    labels[second] = "X" if op_second == 0 else "Y"
+    for index in range(first + 1, second):
+        labels[index] = "Z"
+
+    matrix = np.array([[1.0]], dtype=complex)
+    for label in reversed(labels):
+        matrix = np.kron(matrix, _PAULI[label])
+    return matrix
+
+
+@pytest.mark.parametrize("indices", [(1, 4, 2, 5), (2, 5, 1, 4)])
+@pytest.mark.parametrize("ops", itertools.product((0, 1), repeat=4))
+def test_double_pauli_rotation_overlap_branches(indices, ops):
+    num_qubits = 6
+    angle = 0.73
+    rng = np.random.default_rng(206)
+    ket = rng.normal(
+        size=1 << num_qubits) + 1j * rng.normal(size=1 << num_qubits)
+    ket /= np.linalg.norm(ket)
+
+    i_occ, j_occ, a_virt, b_virt = indices
+    op_i, op_j, op_a, op_b = ops
+    occupied_string = _dense_pair_pauli(num_qubits, i_occ, j_occ, op_i, op_j)
+    virtual_string = _dense_pair_pauli(num_qubits, a_virt, b_virt, op_a, op_b)
+    generator = occupied_string @ virtual_string
+    reference = (np.cos(angle / 2) * np.eye(1 << num_qubits) -
+                 1j * np.sin(angle / 2) * generator) @ ket
+
+    actual = np.asarray(
+        cudaq.get_state(_double_pauli_rotation_entry,
+                        algorithms.state_from(ket), angle, *indices, *ops))
+    single_precision = np.dtype(cudaq.complex()) == np.dtype(np.complex64)
+    tolerance = 5e-5 if single_precision else 1e-12
+    assert np.max(np.abs(actual - reference)) < tolerance

@@ -30,6 +30,15 @@ import pytest
 import cudaq
 
 from cudaq_algorithms.primitives import AliasSamplingPrepare
+from cudaq_algorithms.primitives._alias_sampling import _vose_tables
+
+
+def test_vose_residual_skips_zero_weight_bins():
+    keep, alias, table = _vose_tables([0.8, 0.8, 0.0, 0.0], mu=1)
+
+    assert keep == [1, 1, 0, 0]
+    assert alias == [0, 1, 0, 1]
+    np.testing.assert_allclose(table, [0.5, 0.5, 0.0, 0.0], atol=1e-15)
 
 
 def _brute_force_marginal(prep: AliasSamplingPrepare) -> np.ndarray:
@@ -127,7 +136,7 @@ def test_alias_sampling_uniform_is_exact():
 
 @pytest.mark.parametrize("weights,mu", [([0.7, 0.2, 1.4], 2),
                                         ([1.0, 3.5, 0.25, 2.0, 0.8], 3),
-                                        ([2.5], 3)])
+                                        ([2.5], 3), ([2.5], 1)])
 def test_alias_sampling_prepare_then_adjoint_is_identity(weights, mu):
     prep = AliasSamplingPrepare(weights, mu)
     prepare = prep.kernel()
@@ -143,6 +152,33 @@ def test_alias_sampling_prepare_then_adjoint_is_identity(weights, mu):
         unprepare(index, garbage)
 
     state = np.array(cudaq.get_state(run))
+    expected = np.zeros(1 << (num_index + num_garbage), dtype=np.complex128)
+    expected[0] = 1.0
+    np.testing.assert_allclose(state, expected, atol=1e-10)
+
+
+def test_alias_sampling_one_bit_index_prepare_and_adjoint():
+    prep = AliasSamplingPrepare([1.0, 3.0], mu=1)
+    assert prep.num_index == 1
+    assert prep.qrom.variant == "select"
+
+    np.testing.assert_allclose(_circuit_marginal(prep),
+                               _brute_force_marginal(prep),
+                               atol=1e-10)
+
+    prepare = prep.kernel()
+    unprepare = prep.adjoint_kernel()
+    num_index = prep.num_index
+    num_garbage = prep.num_garbage
+
+    @cudaq.kernel
+    def roundtrip():
+        index = cudaq.qvector(num_index)
+        garbage = cudaq.qvector(num_garbage)
+        prepare(index, garbage)
+        unprepare(index, garbage)
+
+    state = np.array(cudaq.get_state(roundtrip))
     expected = np.zeros(1 << (num_index + num_garbage), dtype=np.complex128)
     expected[0] = 1.0
     np.testing.assert_allclose(state, expected, atol=1e-10)

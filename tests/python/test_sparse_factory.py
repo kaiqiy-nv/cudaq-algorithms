@@ -25,6 +25,7 @@ quantization bound.
 """
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -32,6 +33,7 @@ import pytest
 import cudaq
 
 from cudaq_algorithms.common_kernels import state_from
+from cudaq_algorithms.sparse._entries import _coerce_entries, _looks_like_triples
 from cudaq_algorithms.sparse import (SparseOracleEncoding, encode_sparse,
                                      qrom_oracles)
 
@@ -206,6 +208,73 @@ def test_qrom_oracles_standalone_matches_dense():
                                atol=oracle_quantization_atol(0.9, 6) * 2.0)
 
 
+def test_qrom_o_val_three_slot_word_load():
+    matrix = np.zeros((4, 4))
+    matrix[0, 1] = matrix[1, 0] = 0.5
+    matrix[1, 2] = matrix[2, 1] = -1.0
+    matrix[2, 3] = matrix[3, 2] = 0.25
+    matrix[0, 0] = 0.75
+    matrix[3, 3] = 0.5
+
+    oracles = qrom_oracles(matrix, value_bits=2)
+    assert oracles.d == 3
+    assert oracles.num_system == 2
+    m = (oracles.d - 1).bit_length()
+    n = oracles.num_system
+    value_bits = oracles.value_bits
+    num_work = oracles.num_work
+    num_qubits = m + n + value_bits + 2 + num_work
+    o_val = oracles.o_val
+
+    @cudaq.kernel
+    def load_values(state: cudaq.State):
+        registers = cudaq.qvector(state)
+        slot = registers[0:m]
+        system = registers[m:m + n]
+        value_and_sign = registers[m + n:m + n + value_bits + 2]
+        work = registers[m + n + value_bits + 2:num_qubits]
+        o_val(slot, system, value_and_sign, work)
+
+    amplitude = 1.0 / math.sqrt(oracles.d * (1 << n))
+    initial = np.zeros(1 << num_qubits, dtype=np.complex128)
+    for slot in range(oracles.d):
+        for row in range(1 << n):
+            initial[slot + (row << m)] = amplitude
+
+    # The two edge matchings are {(0, 1), (2, 3)} and {(1, 2)};
+    # slot 2 is diagonal. Missing rows in each slot are filler mappings.
+    assigned_columns = {
+        (0, 0): 1,
+        (0, 1): 0,
+        (0, 2): 3,
+        (0, 3): 2,
+        (1, 1): 2,
+        (1, 2): 1,
+        (2, 0): 0,
+        (2, 3): 3,
+    }
+    expected = np.zeros_like(initial)
+    for slot in range(oracles.d):
+        for row in range(1 << n):
+            word = 0
+            column = assigned_columns.get((slot, row))
+            if column is not None:
+                entry = matrix[row, column]
+                word = quantized_angle(entry, oracles.h, value_bits)
+                if entry < 0.0:
+                    word |= 1 << value_bits
+                if row < column:
+                    word |= 1 << (value_bits + 1)
+            input_index = slot + (row << m)
+            output_index = input_index + (word << (m + n))
+            expected[output_index] = amplitude
+
+    actual = np.asarray(
+        cudaq.get_state(load_values, state_from(initial,
+                                                num_qubits=num_qubits)))
+    np.testing.assert_allclose(actual, expected, atol=1e-10)
+
+
 def test_qrom_oracles_validation_raises():
     asymmetric = np.array([[0.0, 1.0], [0.0, 0.0]])
     with pytest.raises(ValueError, match="not symmetric"):
@@ -319,6 +388,33 @@ def test_guard_over_budget_raises_actionably():
     # matrix is refused on the count alone.
     with pytest.raises(ValueError, match="max_entries=1"):
         encode_sparse(np.ones((64, 64)), max_entries=1)
+
+
+def test_coerce_entries_rejects_malformed_inputs():
+
+    def coo_input(shape, rows, cols, data):
+        coo = SimpleNamespace(shape=shape, row=rows, col=cols, data=data)
+        return SimpleNamespace(tocoo=lambda: coo)
+
+    with pytest.raises(ValueError, match="matrix must be square"):
+        _coerce_entries(coo_input((1, 2), [0], [0], [1.0]), None)
+    with pytest.raises(ValueError, match="same length"):
+        _coerce_entries((np.array([0]), np.array([0, 1]), np.array([1.0])), 2)
+    with pytest.raises(ValueError, match="matrix must be square"):
+        _coerce_entries(np.ones((1, 2)), None)
+    with pytest.raises(ValueError, match="dimension >= 1"):
+        _coerce_entries(np.empty((0, 0)), None)
+    with pytest.raises(ValueError, match="indices must be integers"):
+        _coerce_entries(coo_input((1, 1), [0.5], [0], [1.0]), None)
+    with pytest.raises(ValueError, match="out of range"):
+        _coerce_entries(coo_input((1, 1), [1], [0], [1.0]), None)
+
+    class Uncoercible:
+
+        def __array__(self, dtype=None):
+            raise TypeError("cannot convert to an array")
+
+    assert not _looks_like_triples(([0], Uncoercible(), [1.0]))
 
 
 def test_argument_validation_raises():
